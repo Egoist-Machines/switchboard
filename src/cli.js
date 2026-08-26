@@ -600,6 +600,7 @@ async function main(args = process.argv.slice(2)) {
       "UserPromptSubmit hooks must be an array",
       "OpenCode plugin installation failed",
       "OpenCode plugin entry already exists and is not managed by Switchboard",
+      ".opencode/package.json exists and is not valid JSON",
       "host config hooks must be an object",
       "UserPromptSubmit entries must contain a hooks array",
       "UserPromptSubmit contains an invalid hook entry",

@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
 import Database from "better-sqlite3";
 
-import { discoverCodingHosts } from "../src/coding.js";
+import { DEFAULT_OPENCODE_PLUGIN, discoverCodingHosts, opencodeEntry } from "../src/coding.js";
 import { formatHookMemoryBlock } from "../src/hook.js";
 import { LocalRepository } from "../src/repository.js";
 import { resolveProjectScope } from "../src/projectIdentity.js";
@@ -68,6 +68,26 @@ function npmStub(directory, body) {
   const target = path.join(directory, "npm");
   writeFileSync(target, `#!/bin/sh\n${body}\n`, { mode: 0o755 });
   chmodSync(target, 0o755);
+}
+
+function npmPluginStub(directory, pluginName = DEFAULT_OPENCODE_PLUGIN.name, beforeInstall = "") {
+  npmStub(directory, [
+    beforeInstall,
+    `mkdir -p "$PWD/node_modules/${pluginName}/src"`,
+    `printf '%s\\n' '{"type":"module"}' > "$PWD/node_modules/${pluginName}/package.json"`,
+    `printf '%s\\n' 'export function createLocalTransport() { return { prefetch: async () => ({ status: "results" }) }; }' > "$PWD/node_modules/${pluginName}/src/localTransport.js"`,
+  ].filter(Boolean).join("\n"));
+}
+
+function pluginTarball(setup, name) {
+  const source = path.join(setup.root, "plugin-tarball-source");
+  const packageDirectory = path.join(source, "package");
+  const archive = path.join(setup.root, "plugin.tgz");
+  mkdirSync(packageDirectory, { recursive: true });
+  writeFileSync(path.join(packageDirectory, "package.json"), `${JSON.stringify({ name, version: "0.0.0" })}\n`);
+  const packed = spawnSync("tar", ["-czf", archive, "-C", source, "package"], { encoding: "utf8" });
+  assert.equal(packed.status, 0, packed.stderr);
+  return archive;
 }
 
 function backupsFor(target) {
@@ -257,22 +277,102 @@ test("Claude and Codex hooks merge, back up, verify, rerun idempotently, and uni
   revokedRepository.close();
 });
 
-test("OpenCode npm install includes peer dependencies", (t) => {
+test("OpenCode install manages its dependency in .opencode", (t) => {
   const setup = fixture(t);
   const npmArgs = path.join(setup.root, "npm-args");
+  const npmCwd = path.join(setup.root, "npm-cwd");
   hostStub(setup.bin, "opencode");
-  npmStub(setup.bin, `printf '%s\\n' "$@" > ${JSON.stringify(npmArgs)}
-mkdir -p "$PWD/node_modules/opencode-ai-passport/src"
-printf '%s\\n' '{"type":"module"}' > "$PWD/node_modules/opencode-ai-passport/package.json"
-printf '%s\\n' 'export function createLocalTransport() { return { prefetch: async () => ({ status: "results" }) }; }' > "$PWD/node_modules/opencode-ai-passport/src/localTransport.js"`);
+  npmPluginStub(setup.bin, DEFAULT_OPENCODE_PLUGIN.name,
+    `printf '%s\\n' "$@" > ${JSON.stringify(npmArgs)}\npwd > ${JSON.stringify(npmCwd)}`);
   assert.equal(setup.run(["init"]).status, 0);
   const installed = setup.run(["coding", "install", "--targets", "opencode", "--project", setup.project]);
   assert.equal(installed.status, 0, installed.stderr);
   const args = readFileSync(npmArgs, "utf8").trim().split("\n");
   assert.deepEqual(args, [
-    "install", "--no-save", "--package-lock=false", "--ignore-scripts", "--no-audit", "--no-fund", "opencode-ai-passport",
+    "install", "--package-lock=false", "--ignore-scripts", "--no-audit", "--no-fund",
   ]);
+  assert.equal(readFileSync(npmCwd, "utf8").trim(), realpathSync(path.join(setup.project, ".opencode")));
+  assert.equal(args.includes("--no-save"), false);
   assert.equal(args.includes("--legacy-peer-deps"), false);
+  const packageJson = path.join(setup.project, ".opencode", "package.json");
+  assert.deepEqual(JSON.parse(readFileSync(packageJson, "utf8")), {
+    dependencies: { [DEFAULT_OPENCODE_PLUGIN.name]: DEFAULT_OPENCODE_PLUGIN.spec },
+  });
+  const entry = path.join(setup.project, ".opencode", "plugin", "ai-passport.js");
+  assert.equal(readFileSync(entry, "utf8"), opencodeEntry(DEFAULT_OPENCODE_PLUGIN.name));
+  assert.equal(existsSync(path.join(setup.project, ".opencode", "node_modules", DEFAULT_OPENCODE_PLUGIN.name, "package.json")), true);
+  const state = stateFor(setup, "opencode").scopes[0];
+  assert.equal(state.plugin_name, DEFAULT_OPENCODE_PLUGIN.name);
+  assert.equal(state.plugin_spec, DEFAULT_OPENCODE_PLUGIN.spec);
+  assert.equal(state.package_json_created, true);
+
+  const uninstall = setup.run(["coding", "uninstall", "--target", "opencode", "--project", setup.project]);
+  assert.equal(uninstall.status, 0, uninstall.stderr);
+  assert.equal(existsSync(packageJson), false);
+  assert.equal(existsSync(path.join(setup.project, ".opencode", "node_modules", DEFAULT_OPENCODE_PLUGIN.name)), false);
+});
+
+test("OpenCode tarball install derives the package name and file spec", (t) => {
+  const setup = fixture(t);
+  const pluginName = "@fixture/opencode-test-plugin";
+  const tarball = pluginTarball(setup, pluginName);
+  hostStub(setup.bin, "opencode");
+  npmPluginStub(setup.bin, pluginName);
+  assert.equal(setup.run(["init"]).status, 0);
+
+  const installed = setup.run([
+    "coding", "install", "--targets", "opencode", "--project", setup.project,
+    "--opencode-plugin-tarball", tarball,
+  ]);
+  assert.equal(installed.status, 0, installed.stderr);
+  const packageJson = JSON.parse(readFileSync(path.join(setup.project, ".opencode", "package.json"), "utf8"));
+  assert.deepEqual(packageJson.dependencies, { [pluginName]: `file:${path.resolve(tarball)}` });
+  assert.equal(readFileSync(path.join(setup.project, ".opencode", "plugin", "ai-passport.js"), "utf8"), opencodeEntry(pluginName));
+});
+
+test("OpenCode merges and backs up a user package.json only once", (t) => {
+  const setup = fixture(t);
+  const packageJsonPath = path.join(setup.project, ".opencode", "package.json");
+  hostStub(setup.bin, "opencode");
+  npmPluginStub(setup.bin);
+  mkdirSync(path.dirname(packageJsonPath), { recursive: true });
+  writeFileSync(packageJsonPath, `${JSON.stringify({ private: true, dependencies: { unrelated: "1.0.0" } }, null, 2)}\n`);
+  assert.equal(setup.run(["init"]).status, 0);
+  assert.equal(setup.run(["coding", "install", "--targets", "opencode", "--project", setup.project]).status, 0);
+  assert.deepEqual(JSON.parse(readFileSync(packageJsonPath, "utf8")), {
+    private: true,
+    dependencies: { unrelated: "1.0.0", [DEFAULT_OPENCODE_PLUGIN.name]: DEFAULT_OPENCODE_PLUGIN.spec },
+  });
+  assert.equal(backupsFor(packageJsonPath).length, 1);
+  assert.equal(setup.run(["coding", "install", "--targets", "opencode", "--project", setup.project]).status, 0);
+  assert.equal(backupsFor(packageJsonPath).length, 1);
+
+  const uninstall = setup.run(["coding", "uninstall", "--target", "opencode", "--project", setup.project]);
+  assert.equal(uninstall.status, 0, uninstall.stderr);
+  assert.deepEqual(JSON.parse(readFileSync(packageJsonPath, "utf8")), {
+    private: true,
+    dependencies: { unrelated: "1.0.0" },
+  });
+  assert.equal(backupsFor(packageJsonPath).length, 1);
+});
+
+test("OpenCode rejects an invalid managed package.json before mutation", (t) => {
+  const setup = fixture(t);
+  const packageJsonPath = path.join(setup.project, ".opencode", "package.json");
+  const npmCalled = path.join(setup.root, "npm-called");
+  hostStub(setup.bin, "opencode");
+  npmPluginStub(setup.bin, DEFAULT_OPENCODE_PLUGIN.name, `touch ${JSON.stringify(npmCalled)}`);
+  mkdirSync(path.dirname(packageJsonPath), { recursive: true });
+  writeFileSync(packageJsonPath, "{not valid JSON\n");
+  assert.equal(setup.run(["init"]).status, 0);
+
+  const installed = setup.run(["coding", "install", "--targets", "opencode", "--project", setup.project]);
+  assert.equal(installed.status, 2);
+  assert.equal(installed.stderr, ".opencode/package.json exists and is not valid JSON\n");
+  assert.equal(readFileSync(packageJsonPath, "utf8"), "{not valid JSON\n");
+  assert.equal(backupsFor(packageJsonPath).length, 0);
+  assert.equal(existsSync(npmCalled), false);
+  assert.equal(existsSync(path.join(setup.switchboardHome, "coding-installations", "opencode.json")), false);
 });
 
 test("OpenCode npm failures include the final stderr lines", (t) => {
@@ -357,6 +457,9 @@ test("OpenCode install uses the packed plugin local transport and writes owner-p
   });
   assert.equal(packed.status, 0, packed.stderr);
   const tarball = path.join(setup.root, packed.stdout.trim().split("\n").at(-1));
+  const packaged = spawnSync("tar", ["-xzOf", tarball, "package/package.json"], { encoding: "utf8" });
+  assert.equal(packaged.status, 0, packaged.stderr);
+  const pluginName = JSON.parse(packaged.stdout).name;
   const install = setup.run([
     "coding", "install", "--targets", "opencode", "--project", setup.project,
     "--opencode-plugin-tarball", tarball,
@@ -364,7 +467,7 @@ test("OpenCode install uses the packed plugin local transport and writes owner-p
   assert.equal(install.status, 0, install.stderr);
   assert.match(install.stdout, /verification: passed_results/);
   assert.match(install.stdout, /owner-present ceremony/);
-  assert.equal(existsSync(path.join(setup.project, "node_modules", "opencode-ai-passport", "src", "localTransport.js")), true);
+  assert.equal(existsSync(path.join(setup.project, ".opencode", "node_modules", pluginName, "src", "localTransport.js")), true);
   const entry = path.join(setup.project, ".opencode", "plugin", "ai-passport.js");
   const entryBody = readFileSync(entry, "utf8");
   assert.match(entryBody, /ambient: \{ enabled: true/);
@@ -396,6 +499,42 @@ test("OpenCode install uses the packed plugin local transport and writes owner-p
   assert.equal(uninstall.status, 0, uninstall.stderr);
   assert.equal(existsSync(entry), false);
   assert.equal(existsSync(credentials), false);
+});
+
+test("old OpenCode scope records retain their project-level verification and uninstall behavior", (t) => {
+  const setup = fixture(t);
+  const packageJsonPath = path.join(setup.project, ".opencode", "package.json");
+  const legacyPackage = path.join(setup.project, "node_modules", "opencode-ai-passport");
+  hostStub(setup.bin, "opencode");
+  npmPluginStub(setup.bin);
+  assert.equal(setup.run(["init"]).status, 0);
+  assert.equal(setup.run(["coding", "install", "--targets", "opencode", "--project", setup.project]).status, 0);
+  const packageJsonBody = readFileSync(packageJsonPath, "utf8");
+  mkdirSync(path.join(legacyPackage, "src"), { recursive: true });
+  writeFileSync(path.join(legacyPackage, "package.json"), "{\"type\":\"module\"}\n");
+  writeFileSync(path.join(legacyPackage, "src", "localTransport.js"),
+    'export function createLocalTransport() { return { prefetch: async () => ({ status: "results" }) }; }\n');
+
+  const state = stateFor(setup, "opencode");
+  const scope = state.scopes[0];
+  delete scope.plugin_name;
+  delete scope.plugin_spec;
+  delete scope.package_json_created;
+  scope.entry_b64 = Buffer.from(opencodeEntry("opencode-ai-passport"), "utf8").toString("base64");
+  writeFileSync(scope.config.target_path, opencodeEntry("opencode-ai-passport"));
+  writeFileSync(path.join(setup.switchboardHome, "coding-installations", "opencode.json"), `${JSON.stringify(state, null, 2)}\n`);
+
+  const status = setup.run(["coding", "status", "--project", setup.project]);
+  assert.equal(status.status, 0, status.stderr);
+  assert.match(status.stdout, /opencode: installed=yes .* config=present/);
+  const doctor = setup.run(["coding", "doctor", "--project", setup.project]);
+  assert.equal(doctor.status, 0, doctor.stderr);
+  assert.match(doctor.stdout, /opencode: discovered=yes verification=passed_results/);
+
+  const uninstall = setup.run(["coding", "uninstall", "--target", "opencode", "--project", setup.project]);
+  assert.equal(uninstall.status, 0, uninstall.stderr);
+  assert.equal(readFileSync(packageJsonPath, "utf8"), packageJsonBody);
+  assert.equal(existsSync(legacyPackage), true);
 });
 
 test("foreign suffix-matching hooks survive install and uninstall byte-for-byte as entries", (t) => {
@@ -686,27 +825,29 @@ test("credential replacement intent is durable before the credential file mutati
   assert.equal(stateFor(setup, "codex").transaction, null);
 });
 
-test("package rename intent is durable and package compensation resumes after its own crash", (t) => {
+test("managed package.json intent is durable and compensation resumes after its own crash", (t) => {
   const setup = fixture(t);
   hostStub(setup.bin, "opencode");
-  const packagePath = path.join(setup.project, "node_modules", "opencode-ai-passport");
-  mkdirSync(packagePath, { recursive: true });
-  writeFileSync(path.join(packagePath, "package.json"), `${JSON.stringify({ name: "preexisting-package" })}\n`);
-  writeFileSync(path.join(packagePath, "sentinel.txt"), "PREEXISTING_PACKAGE\n");
+  const packageJsonPath = path.join(setup.project, ".opencode", "package.json");
+  const originalBody = `${JSON.stringify({ private: true }, null, 2)}\n`;
+  mkdirSync(path.dirname(packageJsonPath), { recursive: true });
+  writeFileSync(packageJsonPath, originalBody);
   assert.equal(setup.run(["init"]).status, 0);
 
   const crashed = setup.run(
     ["coding", "install", "--targets", "opencode", "--project", setup.project],
     null,
-    { SWITCHBOARD_CODING_CRASH_AFTER_MUTATION: "package_rename" },
+    { SWITCHBOARD_CODING_CRASH_AFTER_MUTATION: "package_json_write" },
   );
   assert.equal(crashed.status, 86, crashed.stderr);
   const packageRecord = stateFor(setup, "opencode").transaction.package;
-  assert.equal(packageRecord.path, packagePath);
-  assert.equal(packageRecord.had_original, true);
-  assert.equal(typeof packageRecord.original_fingerprint, "string");
-  assert.equal(existsSync(packagePath), false);
-  assert.equal(existsSync(packageRecord.backup_path), true);
+  assert.equal(packageRecord.package_json_path, packageJsonPath);
+  assert.equal(packageRecord.package_json_created, false);
+  assert.equal(packageRecord.plugin_name, DEFAULT_OPENCODE_PLUGIN.name);
+  assert.equal(packageRecord.plugin_spec, DEFAULT_OPENCODE_PLUGIN.spec);
+  assert.equal(packageRecord.original_existed, true);
+  assert.equal(Buffer.from(packageRecord.original_body_b64, "base64").toString("utf8"), originalBody);
+  assert.notEqual(readFileSync(packageJsonPath, "utf8"), originalBody);
 
   const recoveryCrash = setup.run(
     ["coding", "status", "--project", setup.project],
@@ -714,12 +855,12 @@ test("package rename intent is durable and package compensation resumes after it
     { SWITCHBOARD_CODING_CRASH_AFTER_MUTATION: "rollback_package_restore" },
   );
   assert.equal(recoveryCrash.status, 86, recoveryCrash.stderr);
-  assert.equal(readFileSync(path.join(packagePath, "sentinel.txt"), "utf8"), "PREEXISTING_PACKAGE\n");
+  assert.equal(readFileSync(packageJsonPath, "utf8"), originalBody);
   assert.equal(stateFor(setup, "opencode").transaction.recovery.completed.includes("package_restore"), false);
 
   const recovered = setup.run(["coding", "status", "--project", setup.project]);
   assert.equal(recovered.status, 0, recovered.stderr);
-  assert.equal(readFileSync(path.join(packagePath, "sentinel.txt"), "utf8"), "PREEXISTING_PACKAGE\n");
+  assert.equal(readFileSync(packageJsonPath, "utf8"), originalBody);
   assert.equal(stateFor(setup, "opencode").transaction, null);
   assert.equal(activeInstallerRecords(setup, "opencode").clients.length, 0);
 });
