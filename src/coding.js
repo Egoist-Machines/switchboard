@@ -761,6 +761,19 @@ function installOpenCodeDependency(project, plugin, env, home, state, previous) 
   };
   journalPhase(home, state, "package_json_prepared", { package: record });
   mkdirSync(directory, { recursive: true });
+  // The superseded package is parked before the manifest drops it, because
+  // npm prunes an undeclared package during install and would leave nothing
+  // to restore on rollback. The parking spot must sit outside node_modules,
+  // where npm would prune an unrecognized directory as extraneous.
+  const removedPackagePath = removedPluginName
+    ? openCodePaths(project, removedPluginName).package_path : null;
+  if (removedPackagePath && existsSync(removedPackagePath)) {
+    record.removed_package_backup_path = backupPath(
+      path.join(directory, `.removed-package-${removedPluginName.replaceAll("/", "__")}`));
+    journalPhase(home, state, "package_reconciliation_prepared", { package: record });
+    renameSync(removedPackagePath, record.removed_package_backup_path);
+    injectAfterMutation(env, "package_reconciliation");
+  }
   if (!snapshot.existed || snapshot.body !== installedBody) {
     const alreadyManaged = switchboardManagedOpenCodePackage(snapshot, plugin.name, plugin.spec) ||
       Boolean(previous?.plugin_name && switchboardManagedOpenCodePackage(snapshot, previous.plugin_name, previous.plugin_spec));
@@ -782,13 +795,6 @@ function installOpenCodeDependency(project, plugin, env, home, state, previous) 
   injectAfterMutation(env, "package_npm_install");
   if (!existsSync(path.join(packagePath, "package.json"))) {
     throw new Error("OpenCode plugin installation failed: package missing after npm install");
-  }
-  const removedPackagePath = removedPluginName
-    ? openCodePaths(project, removedPluginName).package_path : null;
-  if (removedPackagePath && existsSync(removedPackagePath)) {
-    record.removed_package_backup_path = backupPath(removedPackagePath);
-    journalPhase(home, state, "package_reconciliation_prepared", { package: record });
-    renameSync(removedPackagePath, record.removed_package_backup_path);
   }
   return record;
 }

@@ -82,9 +82,24 @@ function npmStub(directory, body) {
   chmodSync(target, 0o755);
 }
 
+const NPM_PRUNE_SCRIPT = `node -e '
+const fs = require("fs"), p = require("path");
+const deps = Object.keys(JSON.parse(fs.readFileSync("package.json", "utf8")).dependencies ?? {});
+if (fs.existsSync("node_modules")) for (const entry of fs.readdirSync("node_modules")) {
+  const full = p.join("node_modules", entry);
+  if (entry.startsWith("@")) {
+    for (const name of fs.readdirSync(full)) {
+      if (!deps.includes(entry + "/" + name)) fs.rmSync(p.join(full, name), { recursive: true, force: true });
+    }
+  } else if (!entry.startsWith(".") && !deps.includes(entry)) fs.rmSync(full, { recursive: true, force: true });
+}'`;
+
 function npmPluginStub(directory, pluginName = DEFAULT_OPENCODE_PLUGIN.name, beforeInstall = "") {
+  // Real npm prunes packages the manifest no longer declares; the stub must
+  // model that so reconciliation ordering bugs surface.
   npmStub(directory, [
     beforeInstall,
+    NPM_PRUNE_SCRIPT,
     `mkdir -p "$PWD/node_modules/${pluginName}/src"`,
     `printf '%s\\n' '{"type":"module"}' > "$PWD/node_modules/${pluginName}/package.json"`,
     `printf '%s\\n' 'export function createLocalTransport() { return { prefetch: async () => ({ status: "results" }) }; }' > "$PWD/node_modules/${pluginName}/src/localTransport.js"`,
