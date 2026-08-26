@@ -515,10 +515,19 @@ async function main(args = process.argv.slice(2)) {
       else if (result.status === "ok") {
         process.stdout.write(
           `pulled: ${result.pulled}\napplied: ${result.applied}\ntombstones: ${result.tombstones}\n` +
-          `pushed: ${result.pushed}\nrejected: ${result.rejected}\nreemitted: ${result.reemitted}\n` +
+          `pushed: ${result.pushed}\npending: ${result.pending}\nrejected: ${result.rejected}\nreemitted: ${result.reemitted}\n` +
           `superseded: ${result.superseded}\nconflicts: ${result.conflicts}\n` +
           `skipped: ${result.skipped}\nskipped_handoffs: ${result.skipped_handoffs}\nnew_cursor: ${result.new_cursor}\n`,
         );
+        for (const row of result.content_rejected_rows) {
+          const article = row.category === "instruction" ? "an" : "a";
+          const memory = row.category ? `${article} ${row.category} memory` : "a memory";
+          const created = row.created_at ? ` created ${row.created_at}` : " with an unknown creation time";
+          process.stdout.write(
+            `The hosted content screen rejected ${memory}${created} (entity ${row.entity_id}). ` +
+            "Edit or delete it locally, then run switchboard sync.\n",
+          );
+        }
         if (result.rejected > 0) {
           process.stdout.write(
             "Issue #916: A memory could not sync and stays local; re-save it to retry.\n" +
@@ -593,7 +602,7 @@ async function main(args = process.argv.slice(2)) {
       "project has no repository identity",
       "Run switchboard init first",
       "Use either --project or --global",
-      "Only Claude Code supports --global",
+      "Only Claude Code and OpenCode support --global",
       "No supported coding host was found",
       "invalid coding target",
       "host config must contain one JSON object",
@@ -616,7 +625,9 @@ async function main(args = process.argv.slice(2)) {
       "uninstall requires one valid --target",
       "coding requires install, status, doctor, or uninstall",
     ]);
-    const safe = safeMessages.has(error.message) || /^Coding host not found: (opencode|claude-code|codex)$/.test(error.message);
+    const safe = safeMessages.has(error.message) ||
+      /^Coding host not found: (opencode|claude-code|codex)$/.test(error.message) ||
+      /^OpenCode node_modules contains entries npm does not track: .+\. Remove them or declare them in this directory's package\.json before reinstalling\.$/.test(error.message);
     process.stderr.write(`${safe ? error.message : "Command could not be completed."}\n`);
     return 2;
   } finally {

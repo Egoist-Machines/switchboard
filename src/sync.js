@@ -44,8 +44,15 @@ const PRECLAIM_REJECTION_REASONS = new Set([
   "foreign_replica", "invalid_event", "memory_locked", "prior_pending",
   "replica_sequence_conflict", "sequence_gap", "unauthorized_event",
 ]);
+const CLAIM_REFUSAL_REASONS = new Set([
+  "claim_unavailable", "replica_sequence_conflict", "sequence_gap", "prior_pending",
+]);
 const RECORDED_REJECTION_REASONS = new Set(["invalid_event"]);
 const RECORDED_REJECTION_KEYS = new Set(["event_id", "status", "reason"]);
+const DISTINCT_TRANSPORT_STATUSES = new Set([
+  "sync_refused", "ack_refused", "invalid_response", "pull_required_loop",
+  "hosted_unavailable", "cursor_desync",
+]);
 // The proposal change trigger records stable pending/approved/rejected states,
 // then page hydration replaces that value with the live trust-loop status. The
 // only additional observable states are the two decision workers and their
@@ -58,11 +65,12 @@ const PENDING_PROPOSAL_STATES = new Set(["pending", "promoting", "rejecting"]);
 const REJECTED_PROPOSAL_STATES = new Set(["rejected", "failed"]);
 
 class SyncTransportError extends Error {
-  constructor(code, missingCapability = null) {
+  constructor(code, missingCapability = null, detail = null) {
     super(code);
     this.name = "SyncTransportError";
     this.code = code;
     this.missingCapability = missingCapability;
+    this.detail = detail;
   }
 }
 
@@ -177,6 +185,11 @@ function initializeSyncTables(repository, link, onAfterUpgradeLock = null) {
         CREATE INDEX IF NOT EXISTS hosted_sync_uploads_reemit_candidates
         ON hosted_sync_uploads(link_key, upload_seq)
         WHERE state = 'rejected_recorded' AND reemitted_event_id IS NULL
+      `);
+      repository.db.exec(`
+        CREATE INDEX IF NOT EXISTS hosted_sync_uploads_pending
+        ON hosted_sync_uploads(link_key, upload_seq)
+        WHERE state = 'pending'
       `);
       repository.db.prepare(`
         INSERT OR IGNORE INTO hosted_sync_state(
@@ -323,6 +336,12 @@ function downloadAuthorization(link) {
 
 function state(repository, key) {
   return repository.db.prepare("SELECT * FROM hosted_sync_state WHERE link_key = ?").get(key);
+}
+
+function pendingUploads(repository, key) {
+  return repository.db.prepare(`
+    SELECT count(*) AS count FROM hosted_sync_uploads WHERE link_key = ? AND state = 'pending'
+  `).get(key).count;
 }
 
 function updateCursor(repository, key, cursor, bootstrapComplete = null) {
@@ -851,8 +870,28 @@ async function pullAll({ repository, link, key, fetchImpl, summary }) {
     if (response.status === 409 && body.error === "cursor_not_current") {
       const reconciled = cursorValue(body.cursor);
       const local = cursorValue(current.download_cursor);
-      if (reconciled == null || reconciled !== local) throw new SyncTransportError("invalid_response");
-      throw new SyncTransportError("sync_refused");
+      if (reconciled == null || local == null) throw new SyncTransportError("invalid_response");
+      if (reconciled === local) throw new SyncTransportError("sync_refused");
+      const detail = { local_cursor: String(local), server_cursor: String(reconciled) };
+      if (reconciled < local) throw new SyncTransportError("cursor_desync", null, detail);
+      const changes = repository.db.prepare(`
+        SELECT DISTINCT change_seq FROM hosted_sync_changes
+        WHERE link_key = ?
+          AND CAST(change_seq AS INTEGER) > CAST(? AS INTEGER)
+          AND CAST(change_seq AS INTEGER) <= CAST(? AS INTEGER)
+        ORDER BY CAST(change_seq AS INTEGER)
+      `).all(key, String(local), String(reconciled));
+      let expected = local + 1n;
+      for (const change of changes) {
+        if (cursorValue(change.change_seq) !== expected) {
+          throw new SyncTransportError("cursor_desync", null, detail);
+        }
+        expected += 1n;
+      }
+      if (expected !== reconciled + 1n) throw new SyncTransportError("cursor_desync", null, detail);
+      updateCursor(repository, key, String(reconciled), current.bootstrap_complete === 1);
+      summary.new_cursor = String(reconciled);
+      continue;
     }
     if (response.status === 403 && body.error === "sync_device_not_approved") throw new SyncTransportError("not_approved");
     if (
@@ -871,11 +910,21 @@ async function pullAll({ repository, link, key, fetchImpl, summary }) {
     }
     stalledPages = 0;
     applyPage(repository, key, page, summary);
-    const acknowledged = await hostedRequest(fetchImpl, `${link.base_url}/sync/v1/ack`, {
-      method: "POST",
-      headers: authorization(link, { "content-type": "application/json" }),
-      body: JSON.stringify({ cursor: page.cursor }),
-    });
+    let acknowledged;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        acknowledged = await hostedRequest(fetchImpl, `${link.base_url}/sync/v1/ack`, {
+          method: "POST",
+          headers: authorization(link, { "content-type": "application/json" }),
+          body: JSON.stringify({ cursor: page.cursor }),
+        });
+      } catch (error) {
+        if (attempt === 0 && error instanceof SyncTransportError && error.code === "network_failure") continue;
+        throw error;
+      }
+      if (attempt === 0 && acknowledged.response.status >= 500) continue;
+      break;
+    }
     if (acknowledged.response.status !== 200 || acknowledged.body.ok !== true || String(acknowledged.body.cursor) !== page.cursor) {
       throw new SyncTransportError(acknowledged.response.status >= 500 ? "hosted_unavailable" : "ack_refused");
     }
@@ -1100,6 +1149,17 @@ function finishOutcome(repository, key, mapped, outcome, summary) {
     summary.conflicts += 1;
     summary.conflict_rows.push({ event_id: mapped.event_id, entity_id: mapped.wire_entity_id, winner_event_id: null });
   }
+  if (reason === "content_rejected") {
+    const proposal = repository.db.prepare(`
+      SELECT category, created_at FROM proposals WHERE proposal_id = ?
+    `).get(mapped.wire_entity_id);
+    summary.content_rejected_rows.push({
+      event_id: mapped.event_id,
+      entity_id: mapped.wire_entity_id,
+      category: proposal?.category ?? null,
+      created_at: proposal?.created_at ?? null,
+    });
+  }
   repository.db.prepare(`
     UPDATE hosted_sync_uploads SET state = 'complete', outcome = ? WHERE link_key = ? AND event_id = ?
   `).run(outcome?.status === "duplicate" ? "duplicate" : reason || outcome?.status || "rejected", key, mapped.event_id);
@@ -1110,7 +1170,7 @@ async function pushAll({ repository, link, key, fetchImpl, summary, onAfterUploa
   let pullRequiredLoops = 0;
   for (;;) {
     const mapped = assignUploads(repository, link, key, summary);
-    if (!mapped.length) return;
+    if (!mapped.length) break;
     const shaped = mapped.map((row) => uploadShape(repository, link, row));
     if (shaped.some((row) => !row)) throw new SyncTransportError("local_sync_state_invalid");
     const contentRecords = shaped.map((row) => row.content).filter(Boolean);
@@ -1126,27 +1186,36 @@ async function pushAll({ repository, link, key, fetchImpl, summary, onAfterUploa
       continue;
     }
     if (result.response.status === 403 && result.body.error === "sync_device_not_approved") throw new SyncTransportError("not_approved");
-    if (result.response.status !== 200 || !exactKeys(result.body, new Set(["outcomes", "upload_seq"])) ||
-      !Array.isArray(result.body.outcomes)) {
+    if (result.response.status !== 200) {
       throw new SyncTransportError(result.response.status >= 500 ? "hosted_unavailable" : "sync_refused");
     }
-    const uploadSeq = result.body.upload_seq;
-    if (!Number.isSafeInteger(uploadSeq) || uploadSeq < 0 || result.body.outcomes.length !== mapped.length ||
-      uploadSeq !== mapped.at(-1).upload_seq ||
-      result.body.outcomes.some((outcome, index) => !validateOutcome(outcome, mapped[index])) ||
-      result.body.outcomes.some((outcome) => !isRecordedRejection(outcome) &&
-        outcome.status === "rejected" && PRECLAIM_REJECTION_REASONS.has(outcome.reason))) {
+    if (!exactKeys(result.body, new Set(["outcomes", "upload_seq"])) || !Array.isArray(result.body.outcomes)) {
       throw new SyncTransportError("invalid_response");
     }
-    await onAfterUploadResponse?.({ mapped, outcomes: result.body.outcomes });
+    const uploadSeq = result.body.upload_seq;
+    const outcomes = result.body.outcomes;
+    let lastClaimed = -1;
+    for (let index = 0; index < outcomes.length; index += 1) {
+      if (!CLAIM_REFUSAL_REASONS.has(outcomes[index]?.reason)) lastClaimed = index;
+    }
+    if (!Number.isSafeInteger(uploadSeq) || uploadSeq < 0 || outcomes.length < 1 || outcomes.length > mapped.length ||
+      outcomes.some((outcome, index) => !validateOutcome(outcome, mapped[index])) ||
+      outcomes.some((outcome, index) => CLAIM_REFUSAL_REASONS.has(outcome?.reason) && index !== outcomes.length - 1) ||
+      (lastClaimed >= 0 && uploadSeq !== mapped[lastClaimed].upload_seq)) {
+      throw new SyncTransportError("invalid_response");
+    }
+    await onAfterUploadResponse?.({ mapped, outcomes });
     repository.db.transaction(() => {
-      for (let index = 0; index < result.body.outcomes.length; index += 1) {
-        const outcome = result.body.outcomes[index];
+      for (let index = 0; index < outcomes.length; index += 1) {
+        const outcome = outcomes[index];
+        if (outcome.retryable === true) continue;
         if (isRecordedRejection(outcome)) finishRecordedRejection(repository, key, mapped[index], outcome, summary);
         else finishOutcome(repository, key, mapped[index], outcome, summary);
       }
     })();
+    if (outcomes.length < mapped.length || outcomes.some((outcome) => outcome.retryable === true)) break;
   }
+  summary.pending = pendingUploads(repository, key);
 }
 
 export function emptySyncSummary(status = "ok") {
@@ -1156,6 +1225,7 @@ export function emptySyncSummary(status = "ok") {
     applied: 0,
     tombstones: 0,
     pushed: 0,
+    pending: 0,
     rejected: 0,
     reemitted: 0,
     replay_queued: 0,
@@ -1165,6 +1235,8 @@ export function emptySyncSummary(status = "ok") {
     skipped_handoffs: 0,
     new_cursor: "0",
     conflict_rows: [],
+    content_rejected_rows: [],
+    failure_detail: null,
   };
 }
 
@@ -1174,6 +1246,18 @@ export function syncFailureMessage(result) {
   if (result?.status === "not_approved") return "The linked sync device is not approved.";
   if (result?.status === "upgrade_required") {
     return `Upgrade Switchboard to continue hosted sync. Required capability: ${result.missing_capability}.`;
+  }
+  if (result?.status === "sync_refused") return "The hosted plane refused the sync request.";
+  if (result?.status === "ack_refused") return "The hosted plane refused the cursor acknowledgement.";
+  if (result?.status === "invalid_response") {
+    return "The hosted plane answered with a response shape this Switchboard client does not recognize.";
+  }
+  if (result?.status === "pull_required_loop") return "Hosted sync push kept being fenced behind pulls.";
+  if (result?.status === "hosted_unavailable") return "The hosted plane answered with server errors.";
+  if (result?.status === "cursor_desync") {
+    const local = result.failure_detail?.local_cursor ?? "unknown";
+    const server = result.failure_detail?.server_cursor ?? "unknown";
+    return `Hosted sync cursors have diverged (local ${local}, server ${server}). Hosted sync stays paused and local memories are unaffected. Contact support to reset this device's hosted sync journal.`;
   }
   return "Hosted sync is unavailable.";
 }
@@ -1224,8 +1308,11 @@ export async function syncOnce({
   } catch (error) {
     const status = error?.code === "network_failure" ? "network_failure" :
       error?.code === "not_approved" ? "not_approved" :
-      error?.code === "upgrade_required" ? "upgrade_required" : "unavailable";
+      error?.code === "upgrade_required" ? "upgrade_required" :
+      error instanceof SyncTransportError && DISTINCT_TRANSPORT_STATUSES.has(error.code) ? error.code : "unavailable";
     summary.status = status;
+    summary.pending = pendingUploads(repository, key);
+    summary.failure_detail = error instanceof SyncTransportError ? error.detail : null;
     summary.new_cursor = state(repository, key).download_cursor;
     return status === "upgrade_required"
       ? { ...summary, missing_capability: error.missingCapability }

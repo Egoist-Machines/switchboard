@@ -10,6 +10,7 @@ import { createInterface } from "node:readline/promises";
 import Database from "better-sqlite3";
 
 import { resolveProjectIdentity, resolveProjectScope, scopeForRemote } from "./projectIdentity.js";
+import { screenContent } from "./repository.js";
 
 const INSTRUCTION_FILE = /^(?:claude|agents)(?:\.[^.]+)*\.md$|(?:instruction|instructions|rules)(?:\.[^.]+)*\.(?:md|rules)$/i;
 const DISABLED_MEMORY_MODES = new Set(["0", "disabled", "false", "none", "off"]);
@@ -59,13 +60,19 @@ function saveId(repository, sourceKey, content) {
 }
 
 function entry(repository, { source, sourceKey, content, projectScope = null, note = null, category = null }) {
+  const resolvedCategory = category ?? bucket(content, projectScope);
+  const contentRefusal = screenContent(content);
+  const refusalNote = contentRefusal
+    ? `The local content screen will refuse this ${source} item (${resolvedCategory}) with reason ${contentRefusal}.`
+    : null;
   return {
     source,
     source_key: sourceKey,
     content,
     project_scope: projectScope,
-    category: category ?? bucket(content, projectScope),
-    note,
+    category: resolvedCategory,
+    note: [note, refusalNote].filter(Boolean).join(" ") || null,
+    content_refusal: contentRefusal,
     save_id: saveId(repository, sourceKey, content),
   };
 }
@@ -414,6 +421,10 @@ export async function importCodingMemories({
   try {
     for (const [index, item] of discovery.entries.entries()) {
       if (item.already_present) continue;
+      if (item.content_refusal) {
+        skipped += 1;
+        continue;
+      }
       let accepted = false;
       if (confirm) accepted = Boolean(await confirm(item, index));
       else {

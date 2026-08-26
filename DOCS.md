@@ -201,13 +201,15 @@ Claude Code uses **`~/.claude/settings.json`** by default. Use `--project <direc
 codex: hook trust could not be recorded: <reason>. Open codex in this project and trust the hook via /hooks.
 ```
 
-OpenCode installs **`@egoistmachines/opencode-switchboard`** in the project and writes **`.opencode/plugin/ai-passport.js`**. That entry enables ambient memory and hand-offs, treats the install as the owner-present ceremony, and keeps hosted fallback off. The installer records the plugin as a regular dependency in **`.opencode/package.json`**, creates that manifest when needed, and merges into an existing manifest after creating a timestamped backup. It runs `npm install` inside **`.opencode/`**, which installs the package at **`.opencode/node_modules/@egoistmachines/opencode-switchboard`**. Later npm activity at the project root does not touch that directory. When the directory is missing, OpenCode reinstalls the plugin from the manifest at startup. For development, use a local package archive:
+OpenCode installs **`@egoistmachines/opencode-switchboard`** in its global config directory by default, **`$XDG_CONFIG_HOME/opencode`** when `XDG_CONFIG_HOME` is set or **`~/.config/opencode`** otherwise. The package dependency and **`plugin/ai-passport.js`** entry at that location load in every project, so the adapter follows the owner between repositories. The entry enables ambient memory and hand-offs, treats the install as the owner-present ceremony, and keeps hosted fallback off. Existing `opencode.json`, `opencode.jsonc`, auth data, and foreign package dependencies stay in place. The installer creates or merges **`package.json`**, creates a timestamped backup before changing a foreign manifest, and runs `npm install` in the global config directory. Use `--global` to request this default explicitly.
+
+Use `--project <directory>` for an isolated install in **`<directory>/.opencode`**. The package root is then **`.opencode/`**, and the managed entry remains **`.opencode/plugin/ai-passport.js`**. When the installer creates `.opencode` or its managed manifest, it also creates **`.opencode/.gitignore`** containing `*` unless that ignore file already exists. This keeps the generated directory out of repository status without replacing project-owned ignore rules. Later npm activity at the project root does not touch the isolated package tree. For development, use a local package archive:
 
 ```text
 switchboard coding install --targets opencode --project <directory> --opencode-plugin-tarball <archive>
 ```
 
-The tarball form reads the plugin name from the archive and records a `file:` dependency with the archive's absolute path in the manifest. Uninstall removes that dependency entry and installed package. It deletes the manifest only when the installer created it and no other manifest content remains.
+The tarball form reads the plugin name from the archive and records a `file:` dependency with the archive's absolute path in the manifest. Uninstall removes the managed entry, dependency, and installed plugin package. When Switchboard created the manifest and no foreign dependencies remain, it also removes the generated `node_modules` tree, package lock files, its `.gitignore`, and an empty `plugin` directory. A project `.opencode` directory is removed when empty. The global config directory itself is never removed, and user config, auth files, pre-existing manifests, foreign dependencies, and their `node_modules` tree are preserved. Existing project-scoped OpenCode installs are not migrated automatically. After a global install, Switchboard prints an uninstall command for each one that remains.
 
 For Claude Code and Codex, Switchboard appends only its own hook to existing JSON config and keeps unrelated settings and hooks. OpenCode uses its exact managed entry file and refuses to replace a foreign entry. Each host has one paired client shared across that host's installed project or user scopes; versioned per-host state records every scope, installed entry, and config file identity.
 
@@ -217,7 +219,7 @@ Changing an existing Claude Code or Codex config creates a timestamped backup be
 - Codex: **`~/.local/share/switchboard/codex-credentials.json`**
 - OpenCode: **`switchboard-credentials.json`** in the OpenCode state directory
 
-Use **`switchboard coding status`** to print install state, client ID, active coding categories, config state, and the last verification result for each host. When a host has scopes installed for other projects but not the selected project, status prints `installed=no (N other scopes)`. Codex normally has one user scope, so `--project` does not change its hook location; legacy project-scoped Codex records still use the selected project for status, doctor, and uninstall. The Codex line also prints `hook_trust=ok`, `hook_trust=missing`, `hook_trust=stale`, or `hook_trust=unknown` for the selected installed scope. Use **`switchboard coding doctor`** to repeat discovery and adapter verification and check credential permissions, store health, and Codex hook trust. Doctor exits with code 1 when Codex trust is missing or stale and prints these remediation lines:
+Use **`switchboard coding status`** to print install state, client ID, active coding categories, config state, and the last verification result for each host. When a host has scopes installed for other projects but not the selected project, status prints `installed=no (N other scopes)`. OpenCode selects its user scope by default and a project scope with `--project`. Old project-only OpenCode state remains visible, verifiable, and removable. Codex normally has one user scope, so `--project` does not change its hook location; legacy project-scoped Codex records still use the selected project for status, doctor, and uninstall. The Codex line also prints `hook_trust=ok`, `hook_trust=missing`, `hook_trust=stale`, or `hook_trust=unknown` for the selected installed scope. Use **`switchboard coding doctor`** to repeat discovery and adapter verification and check credential permissions, store health, and Codex hook trust. Doctor exits with code 1 when Codex trust is missing or stale and prints these remediation lines:
 
 ```text
 remediation: switchboard coding install --targets codex --project .
@@ -237,11 +239,11 @@ Both commands keep memory text, queries, secrets, and project values out of thei
 switchboard coding uninstall --target <host> [--project <directory>] [--keep-client]
 ```
 
-Uninstall removes only the exact entry recorded for that scope and leaves unrelated config entries and other installed scopes unchanged. When the last scope is removed, it deletes the credential and revokes the client and grant; use `--keep-client` only when they must remain. Missing or malformed install state fails closed without touching config, credentials, clients, or grants, and deleting local memories remains a separate owner action.
+Uninstall removes only the exact entry recorded for that scope and leaves unrelated config entries and other installed scopes unchanged. For OpenCode, omitting `--project` removes the user scope when present, then falls back to the current-directory project scope for old project-only installs. Passing `--project` selects that exact project scope. When the last scope is removed, uninstall deletes the credential and revokes the client and grant; use `--keep-client` only when they must remain. Missing or malformed install state fails closed without touching config, credentials, clients, or grants, and deleting local memories remains a separate owner action.
 
 ### Import coding memory
 
-**`switchboard coding import`** discovers existing coding-agent guidance and shows every candidate before it saves anything. Each candidate has a source label, category, and global or project scope. The command asks for an individual `y` or `n` decision. `--dry-run` prints the same preview without prompting or saving.
+**`switchboard coding import`** discovers existing coding-agent guidance and shows every candidate before it saves anything. Each candidate has a source label, category, and global or project scope. The command asks for an individual `y` or `n` decision for each importable item. Items refused by the local content screen remain in the preview with the refusal reason, but are skipped without a prompt. `--dry-run` prints the same preview without prompting or saving.
 
 ```text
 switchboard coding import [--project <directory>] [--dry-run]
@@ -400,7 +402,7 @@ The default **Switchboard home** is **`~/.switchboard`**; set **`SWITCHBOARD_HOM
 
 Runtime memory operations run offline: Switchboard sends no memory text, proposal, query, hand-off snapshot, or client secret off the machine. The one exception is `switchboard coding install` for OpenCode, which runs `npm install` and may contact the npm registry to fetch the plugin package; no store content is involved. Memory text and snapshots stay outside events, receipts, status output, and hand-off lists. Client secrets enter machine commands through local standard input, appear once when created, and persist only as salted hashes in the store.
 
-Switchboard does not store recall queries. Events store a keyed project fingerprint instead of the project value. Linked stores keep the hosted owner scope key and their original replica scope key in private database metadata. Content screening rejects full payment-card numbers, private keys, known service secrets, binary content, and oversized content; each memory or hand-off payload has a 32 KiB limit.
+Switchboard does not store recall queries. Events store a keyed project fingerprint instead of the project value. Linked stores keep the hosted owner scope key and their original replica scope key in private database metadata. The local content screen rejects full payment-card numbers, private keys, known service secrets, binary content, and oversized content, with a 32 KiB limit for each memory or hand-off payload. During sync, the hosted plane runs a stricter sensitive-content screen and can terminally reject content the local store accepted. A rejected item stays local-only and is reported per item in sync output. `switchboard coding import` surfaces local-screen refusals per item at preview time.
 
 ## Upgrading
 
@@ -471,6 +473,29 @@ The first pull uses the hosted snapshot.
 
 Later pulls use ordered change pages from the last acknowledged cursor.
 
+A successful cycle has status `ok`. It may still report `pending` uploads when
+the hosted plane asks the client to retry an item or truncates a batch at a
+claim refusal. Those rows keep their event IDs and upload sequences and are
+offered again on the next cycle. The client stops pushing for the current cycle
+so it does not bypass hosted backoff.
+
+JSON summaries include `pending`, `content_rejected_rows`, and
+`failure_detail`. `pending` is the number of assigned upload rows still queued.
+Each `content_rejected_rows` entry contains `event_id`, `entity_id`, `category`,
+and `created_at`, never the rejected content. `failure_detail` is normally null
+and carries the local and server cursors for `cursor_desync`.
+
+Sync failures keep distinct statuses. `sync_refused` means the hosted plane
+refused the sync request. `ack_refused` means it refused the cursor
+acknowledgement. `invalid_response` means the response shape was not recognized.
+`pull_required_loop` means push remained fenced behind repeated pulls.
+`hosted_unavailable` means the hosted plane returned server errors.
+`cursor_desync` means the hosted cursor moved past changes this device never
+recorded. The client fails closed and leaves local memories unaffected. Hosted
+sync stays paused until support resets this device's hosted sync journal.
+Network failure, device approval, and client upgrade failures remain
+`network_failure`, `not_approved`, and `upgrade_required`.
+
 ### Sync capabilities
 
 The closed capability vocabulary is currently `null_tombstones`. It means the client can ingest tombstone fence rows whose hosted memory ID and category are null. The current Switchboard release declares every capability in the vocabulary when it mints a link ticket.
@@ -488,6 +513,13 @@ The response contains no row data. `switchboard sync` prints an instruction to u
 The server may require a new capability when it introduces another wire row shape. Old clients receive `upgrade_required` instead of a silently withheld row. Capabilities are not used to widen authorization, and the server does not silently deprecate a shape while devices still need an actionable upgrade path.
 
 Switchboard applies every page before it acknowledges the exact offered boundary.
+
+It retries an acknowledgement once after a network failure or server error. If
+an acknowledgement response was lost after the page committed locally, the
+next `cursor_not_current` response can move the local cursor forward only when
+every intervening change sequence is already recorded locally. The pull loop
+then continues from the reconciled cursor. A missing sequence, or a server
+cursor behind the local cursor, returns `cursor_desync` with both cursor values.
 
 It does not push while a deletion or account fence is unacknowledged.
 
@@ -524,12 +556,14 @@ replay makes the command safe to repeat. Final events return their existing
 outcomes, while pending content-bearing events rerun with the inline content
 still held by the device. If that content was deleted locally, Switchboard sends
 no content record and keeps the server's terminal outcome. Human output reports
-only replay, reemit, rejection, and conflict counts, followed by identifier-free
-guidance when action is needed. `switchboard sync --json` also carries opaque
-event, entity, and winner identifiers in `conflict_rows` so local integrators can
-automate recovery. It does not carry memory content, `save_id`-derived text,
-credentials, paths, or repository names. Other null-event rejection reasons fail
-closed and leave every offered upload pending.
+replay, reemit, rejection, pending, and conflict counts. A hosted content-screen
+rejection also prints one local edit-or-delete instruction with its category,
+creation time, and entity ID. `switchboard sync --json` carries opaque event,
+entity, and winner identifiers in `conflict_rows`, plus the local metadata in
+`content_rejected_rows`, so local integrators can automate recovery. It does not
+carry memory content, `save_id`-derived text, credentials, paths, or repository
+names. Other null-event rejection reasons fail closed and leave every offered
+upload pending.
 
 Review-mode proposals sync as pending proposals with separate content records.
 

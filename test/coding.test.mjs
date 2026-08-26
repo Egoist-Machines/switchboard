@@ -34,6 +34,7 @@ function fixture(t) {
   const env = {
     ...process.env,
     HOME: ownerHome,
+    XDG_CONFIG_HOME: path.join(ownerHome, ".config"),
     SWITCHBOARD_HOME: switchboardHome,
     OPENCODE_STATE_DIR: opencodeState,
     NPM_CONFIG_CACHE: path.join(root, "npm-cache"),
@@ -101,6 +102,7 @@ function npmPluginStub(directory, pluginName = DEFAULT_OPENCODE_PLUGIN.name, bef
     `mkdir -p "$PWD/node_modules/${pluginName}/src"`,
     `printf '%s\\n' '{"type":"module"}' > "$PWD/node_modules/${pluginName}/package.json"`,
     `printf '%s\\n' 'export function createLocalTransport() { return { prefetch: async () => ({ status: "results" }) }; }' > "$PWD/node_modules/${pluginName}/src/localTransport.js"`,
+    `printf '%s\\n' '{"packages":{"node_modules/${pluginName}":{}}}' > "$PWD/node_modules/.package-lock.json"`,
   ].filter(Boolean).join("\n"));
 }
 
@@ -335,6 +337,208 @@ test("OpenCode install manages its dependency in .opencode", (t) => {
   assert.equal(uninstall.status, 0, uninstall.stderr);
   assert.equal(existsSync(packageJson), false);
   assert.equal(existsSync(path.join(setup.project, ".opencode", "node_modules", DEFAULT_OPENCODE_PLUGIN.name)), false);
+});
+
+test("OpenCode project and global installs refuse untracked node_modules before mutation", (t) => {
+  for (const scope of ["project", "global"]) {
+    const setup = fixture(t);
+    const directory = scope === "project"
+      ? path.join(setup.project, ".opencode")
+      : path.join(setup.ownerHome, ".config", "opencode");
+    const packageJsonPath = path.join(directory, "package.json");
+    const sentinelPath = path.join(directory, "node_modules", "sentinel-package", "owned.txt");
+    const npmCalled = path.join(setup.root, `${scope}-npm-called`);
+    const originalManifest = `${JSON.stringify({ private: true }, null, 2)}\n`;
+    hostStub(setup.bin, "opencode");
+    npmPluginStub(setup.bin, DEFAULT_OPENCODE_PLUGIN.name, `touch ${JSON.stringify(npmCalled)}`);
+    mkdirSync(path.dirname(sentinelPath), { recursive: true });
+    writeFileSync(packageJsonPath, originalManifest);
+    writeFileSync(sentinelPath, "user-owned bytes\n");
+    assert.equal(setup.run(["init"]).status, 0);
+
+    const args = ["coding", "install", "--targets", "opencode"];
+    if (scope === "project") args.push("--project", setup.project);
+    else args.push("--global");
+    const installed = setup.run(args);
+    assert.equal(installed.status, 1, `${scope}: ${installed.stderr}`);
+    assert.match(installed.stderr,
+      /opencode: install failed: OpenCode node_modules contains entries npm does not track: sentinel-package\./);
+    assert.match(installed.stderr,
+      /Remove them or declare them in this directory's package\.json before reinstalling\./);
+    assert.equal(readFileSync(sentinelPath, "utf8"), "user-owned bytes\n");
+    assert.equal(readFileSync(packageJsonPath, "utf8"), originalManifest);
+    assert.equal(existsSync(npmCalled), false);
+    assert.equal(existsSync(path.join(setup.switchboardHome, "coding-installations", "opencode.json")), false);
+    assert.equal(existsSync(path.join(directory, ".gitignore")), false);
+  }
+});
+
+test("OpenCode install refuses an extraneous hidden-lockfile entry before mutation", (t) => {
+  const setup = fixture(t);
+  const directory = path.join(setup.project, ".opencode");
+  const packageJsonPath = path.join(directory, "package.json");
+  const foreignPath = path.join(directory, "node_modules", "foreign-package");
+  const sentinelPath = path.join(foreignPath, "owned.txt");
+  const npmCalled = path.join(setup.root, "npm-called");
+  const originalManifest = `${JSON.stringify({
+    private: true, dependencies: { "foreign-package": "1.0.0" },
+  }, null, 2)}\n`;
+  hostStub(setup.bin, "opencode");
+  npmPluginStub(setup.bin, DEFAULT_OPENCODE_PLUGIN.name, `touch ${JSON.stringify(npmCalled)}`);
+  mkdirSync(foreignPath, { recursive: true });
+  writeFileSync(packageJsonPath, originalManifest);
+  writeFileSync(sentinelPath, "user-owned bytes\n");
+  writeFileSync(path.join(directory, "node_modules", ".package-lock.json"), `${JSON.stringify({
+    packages: { "node_modules/foreign-package": { extraneous: true } },
+  })}\n`);
+  assert.equal(setup.run(["init"]).status, 0);
+
+  const installed = setup.run([
+    "coding", "install", "--targets", "opencode", "--project", setup.project,
+  ]);
+  assert.equal(installed.status, 1, installed.stderr);
+  assert.match(installed.stderr, /entries npm does not track: foreign-package/);
+  assert.equal(readFileSync(packageJsonPath, "utf8"), originalManifest);
+  assert.equal(readFileSync(sentinelPath, "utf8"), "user-owned bytes\n");
+  assert.equal(existsSync(npmCalled), false);
+  assert.equal(existsSync(path.join(setup.switchboardHome, "coding-installations", "opencode.json")), false);
+});
+
+test("an extraneous hidden-lockfile entry blocks OpenCode tree removal", (t) => {
+  const setup = fixture(t);
+  const directory = path.join(setup.project, ".opencode");
+  const nodeModulesPath = path.join(directory, "node_modules");
+  const packagePath = path.join(nodeModulesPath, DEFAULT_OPENCODE_PLUGIN.name);
+  const extraneousPath = path.join(nodeModulesPath, "extraneous-package");
+  hostStub(setup.bin, "opencode");
+  npmPluginStub(setup.bin);
+  assert.equal(setup.run(["init"]).status, 0);
+  assert.equal(setup.run([
+    "coding", "install", "--targets", "opencode", "--project", setup.project,
+  ]).status, 0);
+  mkdirSync(extraneousPath, { recursive: true });
+  writeFileSync(path.join(extraneousPath, "sentinel"), "keep me\n");
+  writeFileSync(path.join(nodeModulesPath, ".package-lock.json"), `${JSON.stringify({ packages: {
+    [`node_modules/${DEFAULT_OPENCODE_PLUGIN.name}`]: {},
+    "node_modules/extraneous-package": { extraneous: true },
+  } })}\n`);
+
+  const uninstalled = setup.run([
+    "coding", "uninstall", "--target", "opencode", "--project", setup.project,
+  ]);
+  assert.equal(uninstalled.status, 0, uninstalled.stderr);
+  assert.equal(existsSync(nodeModulesPath), true);
+  assert.equal(readFileSync(path.join(extraneousPath, "sentinel"), "utf8"), "keep me\n");
+  assert.equal(existsSync(packagePath), false);
+});
+
+test("a hidden cache permits OpenCode install but blocks uninstall tree removal", (t) => {
+  const setup = fixture(t);
+  const directory = path.join(setup.project, ".opencode");
+  const nodeModulesPath = path.join(directory, "node_modules");
+  const packagePath = path.join(nodeModulesPath, DEFAULT_OPENCODE_PLUGIN.name);
+  const cachePath = path.join(nodeModulesPath, ".cache");
+  hostStub(setup.bin, "opencode");
+  npmPluginStub(setup.bin);
+  assert.equal(setup.run(["init"]).status, 0);
+  assert.equal(setup.run([
+    "coding", "install", "--targets", "opencode", "--project", setup.project,
+  ]).status, 0);
+  mkdirSync(cachePath, { recursive: true });
+  writeFileSync(path.join(cachePath, "sentinel"), "keep me\n");
+
+  const reinstalled = setup.run([
+    "coding", "install", "--targets", "opencode", "--project", setup.project,
+  ]);
+  assert.equal(reinstalled.status, 0, reinstalled.stderr);
+  assert.equal(stateFor(setup, "opencode").scopes[0].node_modules_created, true);
+  const uninstalled = setup.run([
+    "coding", "uninstall", "--target", "opencode", "--project", setup.project,
+  ]);
+  assert.equal(uninstalled.status, 0, uninstalled.stderr);
+  assert.equal(existsSync(nodeModulesPath), true);
+  assert.equal(readFileSync(path.join(cachePath, "sentinel"), "utf8"), "keep me\n");
+  assert.equal(existsSync(packagePath), false);
+});
+
+test("OpenCode reinstall refusal leaves an untracked addition for conservative uninstall", (t) => {
+  const setup = fixture(t);
+  const directory = path.join(setup.project, ".opencode");
+  const nodeModulesPath = path.join(directory, "node_modules");
+  const packagePath = path.join(nodeModulesPath, DEFAULT_OPENCODE_PLUGIN.name);
+  const sentinelPath = path.join(nodeModulesPath, "user-note.txt");
+  const treeManifestPath = path.join(nodeModulesPath, ".package-lock.json");
+  hostStub(setup.bin, "opencode");
+  npmPluginStub(setup.bin);
+  assert.equal(setup.run(["init"]).status, 0);
+  assert.equal(setup.run([
+    "coding", "install", "--targets", "opencode", "--project", setup.project,
+  ]).status, 0);
+  const treeManifest = readFileSync(treeManifestPath, "utf8");
+  writeFileSync(sentinelPath, "keep me\n");
+
+  const reinstall = setup.run([
+    "coding", "install", "--targets", "opencode", "--project", setup.project,
+  ]);
+  assert.equal(reinstall.status, 1, reinstall.stderr);
+  assert.match(reinstall.stderr, /entries npm does not track: user-note\.txt/);
+  assert.equal(readFileSync(sentinelPath, "utf8"), "keep me\n");
+  assert.equal(existsSync(path.join(packagePath, "package.json")), true);
+
+  const uninstall = setup.run([
+    "coding", "uninstall", "--target", "opencode", "--project", setup.project,
+  ]);
+  assert.equal(uninstall.status, 0, uninstall.stderr);
+  assert.equal(existsSync(nodeModulesPath), true);
+  assert.equal(readFileSync(sentinelPath, "utf8"), "keep me\n");
+  assert.equal(readFileSync(treeManifestPath, "utf8"), treeManifest);
+  assert.equal(existsSync(packagePath), false);
+});
+
+test("same-name OpenCode reinstall failures restore the working package byte for byte", (t) => {
+  for (const failurePoint of ["before npm mutation", "after npm mutation"]) {
+    const setup = fixture(t);
+    const packagePath = path.join(
+      setup.project, ".opencode", "node_modules", DEFAULT_OPENCODE_PLUGIN.name,
+    );
+    const packageJsonPath = path.join(packagePath, "package.json");
+    const transportPath = path.join(packagePath, "src", "localTransport.js");
+    const sentinelPath = path.join(packagePath, "working-package.bin");
+    hostStub(setup.bin, "opencode");
+    npmPluginStub(setup.bin);
+    assert.equal(setup.run(["init"]).status, 0);
+    assert.equal(setup.run([
+      "coding", "install", "--targets", "opencode", "--project", setup.project,
+    ]).status, 0);
+    writeFileSync(sentinelPath, Buffer.from([0, 1, 2, 3, 255]));
+    const before = [packageJsonPath, transportPath, sentinelPath].map((file) => readFileSync(file));
+
+    if (failurePoint === "before npm mutation") {
+      npmStub(setup.bin, "printf '%s\\n' 'failed before mutation' >&2\nexit 1");
+    } else {
+      npmStub(setup.bin, [
+        NPM_PRUNE_SCRIPT,
+        `mkdir -p "$PWD/node_modules/${DEFAULT_OPENCODE_PLUGIN.name}/src"`,
+        `printf '%s\\n' '{"type":"module","mutated":true}' > "$PWD/node_modules/${DEFAULT_OPENCODE_PLUGIN.name}/package.json"`,
+        `printf '%s\\n' 'throw new Error("mutated")' > "$PWD/node_modules/${DEFAULT_OPENCODE_PLUGIN.name}/src/localTransport.js"`,
+        `printf '%s\\n' 'mutated' > "$PWD/node_modules/${DEFAULT_OPENCODE_PLUGIN.name}/working-package.bin"`,
+        "printf '%s\\n' 'failed after mutation' >&2",
+        "exit 1",
+      ].join("\n"));
+    }
+
+    const reinstalled = setup.run([
+      "coding", "install", "--targets", "opencode", "--project", setup.project,
+    ]);
+    assert.equal(reinstalled.status, 1, `${failurePoint}: ${reinstalled.stderr}`);
+    assert.match(reinstalled.stderr, new RegExp(failurePoint.replace("npm ", "")));
+    for (const [index, file] of [packageJsonPath, transportPath, sentinelPath].entries()) {
+      assert.deepEqual(readFileSync(file), before[index], `${failurePoint}: ${file}`);
+    }
+    assert.equal(stateFor(setup, "opencode").transaction, null);
+    const doctor = setup.run(["coding", "doctor", "--project", setup.project]);
+    assert.equal(doctor.status, 0, `${failurePoint}: ${doctor.stderr}\n${doctor.stdout}`);
+  }
 });
 
 test("OpenCode tarball install derives the package name and file spec", (t) => {
@@ -1068,6 +1272,66 @@ test("managed package.json intent is durable and compensation resumes after its 
   assert.equal(readFileSync(packageJsonPath, "utf8"), originalBody);
   assert.equal(stateFor(setup, "opencode").transaction, null);
   assert.equal(activeInstallerRecords(setup, "opencode").clients.length, 0);
+});
+
+test("same-name package recovery remediation preserves the restorable package", (t) => {
+  const setup = fixture(t);
+  const directory = path.join(setup.project, ".opencode");
+  const packageJsonPath = path.join(directory, "package.json");
+  const packagePath = path.join(directory, "node_modules", DEFAULT_OPENCODE_PLUGIN.name);
+  const sentinelPath = path.join(packagePath, "working-package.bin");
+  hostStub(setup.bin, "opencode");
+  npmPluginStub(setup.bin);
+  assert.equal(setup.run(["init"]).status, 0);
+  assert.equal(setup.run([
+    "coding", "install", "--targets", "opencode", "--project", setup.project,
+  ]).status, 0);
+  writeFileSync(sentinelPath, "working package\n");
+
+  const crashed = setup.run(
+    ["coding", "install", "--targets", "opencode", "--project", setup.project],
+    null,
+    { SWITCHBOARD_CODING_CRASH_AFTER_MUTATION: "package_reconciliation" },
+  );
+  assert.equal(crashed.status, 86, crashed.stderr);
+  const backupPath = stateFor(setup, "opencode").transaction.package.previous_package_backup_path;
+  assert.equal(existsSync(backupPath), true);
+  rmSync(packageJsonPath);
+  mkdirSync(packageJsonPath);
+
+  const doctor = setup.run(["coding", "doctor", "--project", setup.project]);
+  assert.equal(doctor.status, 1, doctor.stderr);
+  assert.match(doctor.stdout, /remediation \(package_restore\):/);
+  assert.equal(doctor.stdout.includes(backupPath), true);
+  assert.equal(doctor.stdout.includes(packagePath), true);
+  assert.equal(doctor.stdout.includes("remove the Switchboard-created package directory"), false);
+  assert.equal(existsSync(backupPath), false);
+  assert.equal(readFileSync(sentinelPath, "utf8"), "working package\n");
+  assert.equal(stateFor(setup, "opencode").transaction.recovery.status, "needs_attention");
+});
+
+test("fresh package recovery remediation still instructs package removal", (t) => {
+  const setup = fixture(t);
+  const directory = path.join(setup.project, ".opencode");
+  const packageJsonPath = path.join(directory, "package.json");
+  const packagePath = path.join(directory, "node_modules", DEFAULT_OPENCODE_PLUGIN.name);
+  hostStub(setup.bin, "opencode");
+  assert.equal(setup.run(["init"]).status, 0);
+
+  const crashed = setup.run(
+    ["coding", "install", "--targets", "opencode", "--project", setup.project],
+    null,
+    { SWITCHBOARD_CODING_CRASH_AFTER_MUTATION: "package_json_write" },
+  );
+  assert.equal(crashed.status, 86, crashed.stderr);
+  rmSync(packageJsonPath);
+  mkdirSync(packageJsonPath);
+
+  const doctor = setup.run(["coding", "doctor", "--project", setup.project]);
+  assert.equal(doctor.status, 1, doctor.stderr);
+  assert.match(doctor.stdout, /remediation \(package_restore\):/);
+  assert.equal(doctor.stdout.includes(`remove the Switchboard-created package directory ${packagePath}`), true);
+  assert.equal(stateFor(setup, "opencode").transaction.recovery.status, "needs_attention");
 });
 
 test("changed config leaves resumable recovery for doctor with exact remediation", (t) => {

@@ -37,7 +37,7 @@
     "CONTRIBUTING.md"
   ],
   "scripts": {
-    "test": "node --test \"test/*.test.mjs\""
+    "test": "node --test \"test/*.test.mjs\" \"test/*.spec.mjs\""
   },
   "dependencies": {
     "better-sqlite3": "^12.2.0"
