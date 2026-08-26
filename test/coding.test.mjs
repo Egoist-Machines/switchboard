@@ -34,6 +34,7 @@ function fixture(t) {
   const env = {
     ...process.env,
     HOME: ownerHome,
+    XDG_CONFIG_HOME: path.join(ownerHome, ".config"),
     SWITCHBOARD_HOME: switchboardHome,
     OPENCODE_STATE_DIR: opencodeState,
     NPM_CONFIG_CACHE: path.join(root, "npm-cache"),
