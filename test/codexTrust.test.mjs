@@ -86,6 +86,18 @@ test("Codex trust TOML recognizes inline comments without duplicating a table", 
   assert.match(updated, /trusted_hash = "sha256:new"\n/);
 });
 
+test("Codex trust TOML reads and replaces literal trusted_hash strings", () => {
+  const key = "/a/b/.codex/hooks.json:user_prompt_submit:0:0";
+  const header = `[hooks.state."${key}"]`;
+  const original = `${header}\ntrusted_hash = 'sha256:old'\n`;
+  assert.equal(readTrustEntry(original, key), "sha256:old");
+
+  const updated = upsertTrustEntry(original, key, "sha256:new");
+  assert.equal(readTrustEntry(updated, key), "sha256:new");
+  assert.equal((updated.match(/^\s*trusted_hash\s*=/gm) ?? []).length, 1);
+  assert.match(updated, /trusted_hash = "sha256:new"\n/);
+});
+
 test("Codex trust TOML accepts commented headers and preserves CRLF writes", () => {
   const key = "/a/b/.codex/hooks.json:user_prompt_submit:0:0";
   const otherKey = "/a/b/.codex/hooks.json:user_prompt_submit:1:0";

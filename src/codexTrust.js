@@ -97,9 +97,9 @@ function tableBounds(text, stateKey) {
 }
 
 function trustedHashValue(line) {
-  const match = /^\s*trusted_hash\s*=\s*"((?:\\.|[^"\\])*)"\s*(?:#.*)?$/.exec(line);
+  const match = /^\s*trusted_hash\s*=\s*(?:"((?:\\.|[^"\\])*)"|'([^']*)')\s*(?:#.*)?$/.exec(line);
   if (!match) return null;
-  return match[1].replaceAll('\\"', '"').replaceAll("\\\\", "\\");
+  return match[1] === undefined ? match[2] : match[1].replaceAll('\\"', '"').replaceAll("\\\\", "\\");
 }
 
 export function readTrustEntry(configTomlText, stateKey) {

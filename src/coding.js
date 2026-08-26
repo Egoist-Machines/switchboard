@@ -115,11 +115,16 @@ function timestamp() {
   return new Date().toISOString().replaceAll(":", "-");
 }
 
-function backup(target) {
-  if (!existsSync(target)) return null;
+function backupPath(target) {
   let candidate = `${target}.switchboard-backup-${timestamp()}`;
   let suffix = 1;
   while (existsSync(candidate)) candidate = `${target}.switchboard-backup-${timestamp()}-${suffix++}`;
+  return candidate;
+}
+
+function backup(target) {
+  if (!existsSync(target)) return null;
+  const candidate = backupPath(target);
   copyFileSync(target, candidate);
   chmodSync(candidate, statSync(target).mode & 0o777);
   return candidate;
@@ -494,9 +499,20 @@ function resolveOpenCodePlugin(tarball) {
 
 function restoreOpenCodeDependency(record) {
   if (!record) return;
-  rmSync(openCodePaths(path.dirname(path.dirname(record.package_json_path)), record.plugin_name).package_path, {
+  const project = path.dirname(path.dirname(record.package_json_path));
+  rmSync(openCodePaths(project, record.plugin_name).package_path, {
     recursive: true, force: true,
   });
+  if (record.removed_package_backup_path) {
+    const removedPackagePath = openCodePaths(project, record.removed_plugin_name).package_path;
+    if (existsSync(record.removed_package_backup_path)) {
+      if (existsSync(removedPackagePath)) throw new Error("removed OpenCode package and its backup both exist");
+      mkdirSync(path.dirname(removedPackagePath), { recursive: true });
+      renameSync(record.removed_package_backup_path, removedPackagePath);
+    } else if (!existsSync(removedPackagePath)) {
+      throw new Error("removed OpenCode package backup is missing");
+    }
+  }
   if (record.original_existed) atomicText(record.package_json_path, decode(record.original_body_b64), record.original_mode);
   else {
     try { unlinkSync(record.package_json_path); } catch (error) { if (error?.code !== "ENOENT") throw error; }
@@ -510,6 +526,30 @@ function fileMatchesSnapshot(snapshot) {
     return info.isFile() && (info.mode & 0o777) === snapshot.mode &&
       readFileSync(snapshot.path, "utf8") === decode(snapshot.body_b64);
   } catch { return false; }
+}
+
+function restoreCodexTrust(record) {
+  if (!record?.installed_body_b64 || typeof record.state_key !== "string") {
+    if (!fileMatchesSnapshot(record)) restoreFile(record);
+    if (!fileMatchesSnapshot(record)) throw new Error("Codex trust restoration did not verify");
+    return;
+  }
+  const current = snapshotFile(record.path);
+  const currentBody = decode(current.body_b64);
+  if (current.existed && currentBody === decode(record.installed_body_b64)) {
+    restoreFile(record);
+    if (!fileMatchesSnapshot(record)) throw new Error("Codex trust restoration did not verify");
+    return;
+  }
+  const originalValue = readTrustEntry(decode(record.body_b64), record.state_key);
+  const next = originalValue === null
+    ? removeTrustEntry(currentBody, record.state_key)
+    : upsertTrustEntry(currentBody, record.state_key, originalValue);
+  if (next !== currentBody) atomicText(record.path, next, current.mode);
+  const restored = snapshotFile(record.path);
+  if (readTrustEntry(decode(restored.body_b64), record.state_key) !== originalValue) {
+    throw new Error("Codex trust restoration did not verify");
+  }
 }
 
 function restoreConfig(record) {
@@ -599,10 +639,7 @@ function rollbackTransaction(repository, home, state, env = process.env) {
 
   const steps = [];
   if (transaction.config?.installed_body_b64) steps.push(["config", () => restoreConfig(transaction.config)]);
-  if (transaction.trust) steps.push(["trust", () => {
-    if (!fileMatchesSnapshot(transaction.trust)) restoreFile(transaction.trust);
-    if (!fileMatchesSnapshot(transaction.trust)) throw new Error("Codex trust restoration did not verify");
-  }]);
+  if (transaction.trust) steps.push(["trust", () => restoreCodexTrust(transaction.trust)]);
   if (transaction.package) steps.push(["package_restore", () => restoreOpenCodeDependency(transaction.package)]);
   if (transaction.credential_write) steps.push(["credential", () => {
     if (!fileMatchesSnapshot(transaction.credential)) restoreFile(transaction.credential);
@@ -746,8 +783,12 @@ function installOpenCodeDependency(project, plugin, env, home, state, previous) 
   if (!existsSync(path.join(packagePath, "package.json"))) {
     throw new Error("OpenCode plugin installation failed: package missing after npm install");
   }
-  if (removedPluginName) {
-    rmSync(openCodePaths(project, removedPluginName).package_path, { recursive: true, force: true });
+  const removedPackagePath = removedPluginName
+    ? openCodePaths(project, removedPluginName).package_path : null;
+  if (removedPackagePath && existsSync(removedPackagePath)) {
+    record.removed_package_backup_path = backupPath(removedPackagePath);
+    journalPhase(home, state, "package_reconciliation_prepared", { package: record });
+    renameSync(removedPackagePath, record.removed_package_backup_path);
   }
   return record;
 }
@@ -809,6 +850,12 @@ function commitRemediation(home, state, step, error) {
     `then run switchboard coding doctor (${error.message})`;
 }
 
+function removeOpenCodePackageBackup(record) {
+  if (!record?.removed_package_backup_path) return;
+  rmSync(record.removed_package_backup_path, { recursive: true, force: true });
+  if (existsSync(record.removed_package_backup_path)) throw new Error("removed OpenCode package backup remains after commit");
+}
+
 function finalizeTransactionCommit(repository, home, state, env = process.env) {
   const transaction = state.transaction;
   if (!transaction?.commit) return true;
@@ -826,6 +873,16 @@ function finalizeTransactionCommit(repository, home, state, env = process.env) {
     writeState(home, state);
     return false;
   };
+
+  if (!completed.has("package_backup_cleanup")) {
+    try {
+      removeOpenCodePackageBackup(transaction.package);
+      injectAfterMutation(env, "package_backup_cleanup");
+      completed.add("package_backup_cleanup");
+      transaction.recovery = { status: "committing", completed: [...completed], failures: [] };
+      writeState(home, state);
+    } catch (error) { return fail("package_backup_cleanup", error); }
+  }
 
   if (!completed.has("replacement_revocation")) {
     try {
@@ -874,7 +931,8 @@ function recordCodexHookTrust({ hooksJsonPath, entryB64, previous, env, home, st
   const alreadyRecorded = readTrustEntry(next, stateKey) === trustedHash;
   if (!alreadyRecorded) next = upsertTrustEntry(next, stateKey, trustedHash);
   if (next !== original) {
-    journalPhase(home, state, "trust_recorded", { trust });
+    const installedTrust = { ...trust, installed_body_b64: encode(next), state_key: stateKey };
+    journalPhase(home, state, "trust_recorded", { trust: installedTrust });
     injectAfterPhase(env, "trust_recorded");
     if (trust.existed) backup(configPath);
     atomicText(configPath, next, trust.mode);
@@ -1095,13 +1153,13 @@ function install({ args, repository, home, binPath, env }) {
   const targets = explicitTargets ?? (global ? ["claude-code"] : HOSTS.filter((host) => discovered[host]));
   if (!targets.length) throw new Error("No supported coding host was found");
   if (global && targets.some((host) => host !== "claude-code")) throw new Error("Only Claude Code supports --global");
-  for (const host of targets) if (!discovered[host]) throw new Error(`Coding host not found: ${host}`);
   const plugin = resolveOpenCodePlugin(option(args, "--opencode-plugin-tarball"));
 
   const failures = [];
   const plans = [];
   for (const host of targets) {
     try {
+      if (!discovered[host]) throw new Error(`Coding host not found: ${host}`);
       const hadState = existsSync(statePath(home, host));
       const state = readState(home, host);
       const projectClaude = host === "claude-code" && Boolean(projectOption) && !global;

@@ -369,11 +369,49 @@ test("OpenCode tarball reinstalls reconcile a renamed Switchboard dependency", (
   });
   assert.equal(existsSync(path.join(setup.project, ".opencode", "node_modules", firstName)), false);
   assert.equal(existsSync(path.join(setup.project, ".opencode", "node_modules", secondName, "package.json")), true);
+  assert.equal(backupsFor(path.join(setup.project, ".opencode", "node_modules", firstName)).length, 0);
 
   const uninstall = setup.run(["coding", "uninstall", "--target", "opencode", "--project", setup.project]);
   assert.equal(uninstall.status, 0, uninstall.stderr);
   assert.equal(existsSync(packageJsonPath), false);
   assert.equal(existsSync(path.join(setup.project, ".opencode", "node_modules", secondName)), false);
+});
+
+test("OpenCode tarball rename recovery restores the replaced package directory", (t) => {
+  const setup = fixture(t);
+  const firstName = "@fixture/one";
+  const secondName = "@fixture/two";
+  const firstTarball = pluginTarball(setup, firstName);
+  hostStub(setup.bin, "opencode");
+  npmPluginStub(setup.bin, firstName);
+  assert.equal(setup.run(["init"]).status, 0);
+  assert.equal(setup.run([
+    "coding", "install", "--targets", "opencode", "--project", setup.project,
+    "--opencode-plugin-tarball", firstTarball,
+  ]).status, 0);
+
+  const secondTarball = pluginTarball(setup, secondName);
+  npmPluginStub(setup.bin, secondName);
+  const crashed = setup.run(
+    ["coding", "install", "--targets", "opencode", "--project", setup.project,
+      "--opencode-plugin-tarball", secondTarball],
+    null,
+    { SWITCHBOARD_CODING_CRASH_AFTER_PHASE: "package_installed" },
+  );
+  assert.equal(crashed.status, 86, crashed.stderr);
+  const transaction = stateFor(setup, "opencode").transaction;
+  assert.match(transaction.package.removed_package_backup_path, /one\.switchboard-backup-/);
+  assert.equal(existsSync(transaction.package.removed_package_backup_path), true);
+  assert.equal(existsSync(path.join(setup.project, ".opencode", "node_modules", firstName)), false);
+
+  const recovered = setup.run(["coding", "status", "--project", setup.project]);
+  assert.equal(recovered.status, 0, recovered.stderr);
+  const packageJsonPath = path.join(setup.project, ".opencode", "package.json");
+  assert.deepEqual(JSON.parse(readFileSync(packageJsonPath, "utf8")).dependencies, {
+    [firstName]: `file:${path.resolve(firstTarball)}`,
+  });
+  assert.equal(existsSync(path.join(setup.project, ".opencode", "node_modules", firstName, "package.json")), true);
+  assert.equal(setup.run(["coding", "doctor", "--project", setup.project]).status, 0);
 });
 
 test("OpenCode rejects unsafe tarball package names", (t) => {
@@ -1047,6 +1085,23 @@ test("changed config leaves resumable recovery for doctor with exact remediation
   assert.equal(stateFor(setup, "codex").transaction, null);
 });
 
+test("an undiscovered requested host fails without blocking discovered targets", (t) => {
+  const setup = fixture(t);
+  hostStub(setup.bin, "claude");
+  assert.equal(setup.run(["init"]).status, 0);
+
+  const result = setup.run(
+    ["coding", "install", "--targets", "claude-code,codex", "--project", setup.project],
+    null,
+    { PATH: `${setup.bin}${path.delimiter}${path.dirname(process.execPath)}` },
+  );
+  assert.equal(result.status, 1, result.stderr);
+  assert.match(result.stdout, /claude-code: client/);
+  assert.match(result.stderr, /codex: install failed: Coding host not found: codex/);
+  assert.match(result.stderr, /remediation: switchboard coding install --targets codex --project \./);
+  assert.equal(activeInstallerRecords(setup, "claude-code").clients.length, 1);
+});
+
 test("every malformed hook config shape isolates its host preflight failure", (t) => {
   const malformed = [
     [],
@@ -1105,6 +1160,8 @@ test("Codex trust recovery restores config.toml after a trust-write crash", (t) 
     existed: true,
     body_b64: Buffer.from(originalTrust, "utf8").toString("base64"),
     mode: 0o644,
+    installed_body_b64: Buffer.from(readFileSync(trustPath, "utf8"), "utf8").toString("base64"),
+    state_key: codexHookStateKey(codexHooksPath(setup), 0, 0),
   });
 
   const recovered = setup.run(["coding", "status", "--project", setup.project]);
@@ -1116,6 +1173,35 @@ test("Codex trust recovery restores config.toml after a trust-write crash", (t) 
   assert.equal(reinstalled.status, 0, reinstalled.stderr);
   assert.equal(stateFor(setup, "codex").scopes.length, 1);
   assert.equal(setup.run(["coding", "doctor", "--project", setup.project]).status, 0);
+});
+
+test("Codex trust recovery preserves unrelated later config.toml edits", (t) => {
+  const setup = fixture(t);
+  hostStub(setup.bin, "codex");
+  const trustPath = codexTrustPath(setup);
+  const stateKey = codexHookStateKey(codexHooksPath(setup), 0, 0);
+  const originalTrust = upsertTrustEntry("model = \"gpt-5\"\n", stateKey, "sha256:prior");
+  mkdirSync(path.dirname(trustPath), { recursive: true });
+  writeFileSync(trustPath, originalTrust);
+  assert.equal(setup.run(["init"]).status, 0);
+
+  const crashed = setup.run(
+    ["coding", "install", "--targets", "codex", "--project", setup.project],
+    null,
+    { SWITCHBOARD_CODING_CRASH_AFTER_MUTATION: "trust_write" },
+  );
+  assert.equal(crashed.status, 86, crashed.stderr);
+  const transaction = stateFor(setup, "codex").transaction;
+  assert.equal(transaction.trust.state_key, stateKey);
+  const unrelatedLine = "# This was edited after Switchboard wrote trust.\n";
+  writeFileSync(trustPath, `${readFileSync(trustPath, "utf8")}${unrelatedLine}`);
+
+  const recovered = setup.run(["coding", "status", "--project", setup.project]);
+  assert.equal(recovered.status, 0, recovered.stderr);
+  const restored = readFileSync(trustPath, "utf8");
+  assert.match(restored, /This was edited after Switchboard wrote trust/);
+  assert.equal(readTrustEntry(restored, stateKey), "sha256:prior");
+  assert.equal(stateFor(setup, "codex").transaction, null);
 });
 
 test("Codex user-scope reruns do not duplicate its hook, backup, or trust entry", (t) => {
