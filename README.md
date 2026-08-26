@@ -63,6 +63,8 @@ switchboard coding install # Install detected editor adapters
 
 Run the installer with `--targets opencode,claude-code,codex` when you want to select exact hosts. Host-specific scopes, paths, status checks, and uninstall commands are covered in [coding host installation](DOCS.md#install-coding-hosts).
 
+OpenCode installs in `$XDG_CONFIG_HOME/opencode` by default, or `~/.config/opencode` when `XDG_CONFIG_HOME` is unset, so the adapter follows the owner into every project. Use `--project <directory>` for an isolated `.opencode` install. Project installs create `.opencode/.gitignore` with `*` only when no ignore file already exists. For an installer-owned manifest with no foreign dependencies, uninstall also removes the generated dependency tree, lock files, managed ignore file, and an empty project `.opencode` directory. It never removes the global config directory or user files inside it.
+
 ### 4. Link sync, if you want it
 
 Hosted sync across machines runs through [AI Passport](https://ego.ist), the hosted memory plane behind Switchboard. Create your Passport at [ego.ist](https://ego.ist), then link each machine to it.

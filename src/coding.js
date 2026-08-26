@@ -2,7 +2,7 @@ import { spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
   chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync,
-  readlinkSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync,
+  readdirSync, readlinkSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, unlinkSync, writeFileSync,
 } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -57,6 +57,11 @@ function codexUserConfigPath(env = process.env) {
   return path.join(codexHome(env), "config.toml");
 }
 
+function openCodeGlobalConfigDirectory(env) {
+  const xdgConfigHome = typeof env.XDG_CONFIG_HOME === "string" ? env.XDG_CONFIG_HOME.trim() : "";
+  return path.join(xdgConfigHome ? path.resolve(xdgConfigHome) : path.join(ownerHome(env), ".config"), "opencode");
+}
+
 function statePath(home, host) {
   return path.join(home, "coding-installations", `${host}.json`);
 }
@@ -72,7 +77,9 @@ function validScope(value) {
     ["file", "symlink"].includes(value.config.topology) &&
     (!Object.hasOwn(value, "plugin_name") || (typeof value.plugin_name === "string" && value.plugin_name)) &&
     (!Object.hasOwn(value, "plugin_spec") || (typeof value.plugin_spec === "string" && value.plugin_spec)) &&
-    (!Object.hasOwn(value, "package_json_created") || typeof value.package_json_created === "boolean");
+    (!Object.hasOwn(value, "package_json_created") || typeof value.package_json_created === "boolean") &&
+    (!Object.hasOwn(value, "gitignore_created") || typeof value.gitignore_created === "boolean") &&
+    (!Object.hasOwn(value, "opencode_scope") || ["user", "project"].includes(value.opencode_scope));
 }
 
 function emptyState(host) {
@@ -312,7 +319,7 @@ function executableOnPath(name, env = process.env) {
   return false;
 }
 
-function hostPaths(host, { project, projectClaude = false, env = process.env } = {}) {
+function hostPaths(host, { project, projectClaude = false, projectOpenCode = false, env = process.env } = {}) {
   const home = ownerHome(env);
   if (host === "claude-code") return {
     config: projectClaude ? path.join(project, ".claude", "settings.json") : path.join(home, ".claude", "settings.json"),
@@ -321,9 +328,11 @@ function hostPaths(host, { project, projectClaude = false, env = process.env } =
   if (host === "codex") return {
     config: path.join(codexHome(env), "hooks.json"), credential: hostCredentialPath(host, { env, home }),
   };
+  const directory = projectOpenCode ? path.join(project, ".opencode") : openCodeGlobalConfigDirectory(env);
   return {
-    config: path.join(project, ".opencode", "plugin", "ai-passport.js"),
+    config: path.join(directory, "plugin", "ai-passport.js"),
     credential: hostCredentialPath(host, { env, home }),
+    opencode_directory: directory,
   };
 }
 
@@ -332,7 +341,8 @@ export function discoverCodingHosts({ project = process.cwd(), env = process.env
   return {
     "claude-code": executableOnPath("claude", env) || existsSync(path.join(home, ".claude")),
     codex: executableOnPath("codex", env) || existsSync(codexHome(env)),
-    opencode: executableOnPath("opencode", env) || existsSync(hostCredentialPath("opencode", { env, home })) || existsSync(path.join(project, ".opencode")),
+    opencode: executableOnPath("opencode", env) || existsSync(hostCredentialPath("opencode", { env, home })) ||
+      existsSync(openCodeGlobalConfigDirectory(env)) || existsSync(path.join(project, ".opencode")),
   };
 }
 
@@ -348,8 +358,10 @@ function parseTargets(value) {
   return targets;
 }
 
-function scopeId(repository, host, { project, projectClaude }) {
-  const scope = (host === "claude-code" && !projectClaude) || host === "codex" ? "user" : `project:${project}`;
+function scopeId(repository, host, { project, projectClaude, projectOpenCode = false }) {
+  const userScope = (host === "claude-code" && !projectClaude) || host === "codex" ||
+    (host === "opencode" && !projectOpenCode);
+  const scope = userScope ? "user" : `project:${project}`;
   return repository.scopeFingerprint(`coding-install:${host}:${scope}`);
 }
 
@@ -359,12 +371,14 @@ function legacyCodexProjectScopeId(repository, project) {
   return repository.scopeFingerprint(`coding-install:codex:project:${project}`);
 }
 
-function selectedScope(state, repository, host, { project, projectClaude }) {
+function selectedScope(state, repository, host, { project, projectClaude, projectOpenCode = false }) {
   if (host === "codex") {
     const legacy = currentScope(state, legacyCodexProjectScopeId(repository, project));
     if (legacy) return legacy;
   }
-  return currentScope(state, scopeId(repository, host, { project, projectClaude }));
+  const selected = currentScope(state, scopeId(repository, host, { project, projectClaude, projectOpenCode }));
+  if (host !== "opencode" || projectOpenCode || selected) return selected;
+  return currentScope(state, scopeId(repository, host, { project, projectClaude, projectOpenCode: true }));
 }
 
 function activeClient(repository, host, credentialPath, expectedClientId = null) {
@@ -420,8 +434,7 @@ function journalPhase(home, state, phase, additions = {}) {
   writeState(home, state);
 }
 
-function openCodePaths(project, pluginName) {
-  const directory = path.join(project, ".opencode");
+function openCodePaths(directory, pluginName) {
   return {
     directory,
     package_json_path: path.join(directory, "package.json"),
@@ -429,8 +442,8 @@ function openCodePaths(project, pluginName) {
   };
 }
 
-function readOpenCodePackageJson(project) {
-  const { package_json_path: packageJsonPath } = openCodePaths(project, DEFAULT_OPENCODE_PLUGIN.name);
+function readOpenCodePackageJson(directory) {
+  const { package_json_path: packageJsonPath } = openCodePaths(directory, DEFAULT_OPENCODE_PLUGIN.name);
   let info;
   try {
     info = lstatSync(packageJsonPath);
@@ -499,12 +512,12 @@ function resolveOpenCodePlugin(tarball) {
 
 function restoreOpenCodeDependency(record) {
   if (!record) return;
-  const project = path.dirname(path.dirname(record.package_json_path));
-  rmSync(openCodePaths(project, record.plugin_name).package_path, {
+  const directory = path.dirname(record.package_json_path);
+  rmSync(openCodePaths(directory, record.plugin_name).package_path, {
     recursive: true, force: true,
   });
   if (record.removed_package_backup_path) {
-    const removedPackagePath = openCodePaths(project, record.removed_plugin_name).package_path;
+    const removedPackagePath = openCodePaths(directory, record.removed_plugin_name).package_path;
     if (existsSync(record.removed_package_backup_path)) {
       if (existsSync(removedPackagePath)) throw new Error("removed OpenCode package and its backup both exist");
       mkdirSync(path.dirname(removedPackagePath), { recursive: true });
@@ -516,6 +529,10 @@ function restoreOpenCodeDependency(record) {
   if (record.original_existed) atomicText(record.package_json_path, decode(record.original_body_b64), record.original_mode);
   else {
     try { unlinkSync(record.package_json_path); } catch (error) { if (error?.code !== "ENOENT") throw error; }
+  }
+  if (record.gitignore_created) {
+    try { unlinkSync(path.join(directory, ".gitignore")); }
+    catch (error) { if (error?.code !== "ENOENT") throw error; }
   }
 }
 
@@ -724,10 +741,11 @@ const outcome = await transport.prefetch({ categories: ["preference", "fact", "p
 process.stdout.write(JSON.stringify({ status: outcome.status }));
 `;
 
-function verifyOpenCode({ project, home, credentialPath, env, pluginName = DEFAULT_OPENCODE_PLUGIN.name, legacy = false }) {
+function verifyOpenCode({ directory, project, home, credentialPath, env,
+  pluginName = DEFAULT_OPENCODE_PLUGIN.name, legacy = false }) {
   const transportPath = legacy
     ? path.join(project, "node_modules", LEGACY_OPENCODE_PLUGIN_NAME, "src", "localTransport.js")
-    : path.join(project, ".opencode", "node_modules", pluginName, "src", "localTransport.js");
+    : path.join(directory, "node_modules", pluginName, "src", "localTransport.js");
   if (!existsSync(transportPath)) return "failed_plugin_missing";
   const child = spawnSync(process.execPath, ["--input-type=module", "--eval", OPENCODE_VERIFY_SCRIPT], {
     env: { ...env, SWITCHBOARD_OPENCODE_TRANSPORT: transportPath,
@@ -743,14 +761,18 @@ function verifyOpenCode({ project, home, credentialPath, env, pluginName = DEFAU
   } catch { return "failed_adapter"; }
 }
 
-function installOpenCodeDependency(project, plugin, env, home, state, previous) {
-  const snapshot = readOpenCodePackageJson(project);
-  const { directory, package_json_path: packageJsonPath, package_path: packagePath } = openCodePaths(project, plugin.name);
+function installOpenCodeDependency(directory, plugin, env, home, state, previous, projectInstall) {
+  const snapshot = readOpenCodePackageJson(directory);
+  const { package_json_path: packageJsonPath, package_path: packagePath } = openCodePaths(directory, plugin.name);
+  const gitignorePath = path.join(directory, ".gitignore");
+  const gitignoreCreated = projectInstall && !existsSync(gitignorePath) &&
+    (!existsSync(directory) || !snapshot.existed || previous?.gitignore_created);
   const removedPluginName = replacedOpenCodePlugin(snapshot, plugin, previous);
   const installedBody = reconciledOpenCodePackageBody(snapshot, plugin, removedPluginName);
   const record = {
     package_json_path: packageJsonPath,
     package_json_created: !snapshot.existed,
+    gitignore_created: gitignoreCreated,
     plugin_name: plugin.name,
     plugin_spec: plugin.spec,
     ...(removedPluginName ? { removed_plugin_name: removedPluginName } : {}),
@@ -761,12 +783,13 @@ function installOpenCodeDependency(project, plugin, env, home, state, previous) 
   };
   journalPhase(home, state, "package_json_prepared", { package: record });
   mkdirSync(directory, { recursive: true });
+  if (gitignoreCreated) atomicText(gitignorePath, "*\n", 0o644);
   // The superseded package is parked before the manifest drops it, because
   // npm prunes an undeclared package during install and would leave nothing
   // to restore on rollback. The parking spot must sit outside node_modules,
   // where npm would prune an unrecognized directory as extraneous.
   const removedPackagePath = removedPluginName
-    ? openCodePaths(project, removedPluginName).package_path : null;
+    ? openCodePaths(directory, removedPluginName).package_path : null;
   if (removedPackagePath && existsSync(removedPackagePath)) {
     const removedNameDigest = createHash("sha256").update(removedPluginName, "utf8").digest("hex").slice(0, 16);
     record.removed_package_backup_path = backupPath(
@@ -800,8 +823,41 @@ function installOpenCodeDependency(project, plugin, env, home, state, previous) 
   return record;
 }
 
-function uninstallOpenCodeDependency(scope, snapshot = readOpenCodePackageJson(scope.project)) {
-  const { package_json_path: packageJsonPath, package_path: packagePath } = openCodePaths(scope.project, scope.plugin_name);
+function removeFileIfPresent(target) {
+  try { unlinkSync(target); } catch (error) { if (error?.code !== "ENOENT") throw error; }
+}
+
+function removeEmptyDirectory(target) {
+  try {
+    if (lstatSync(target).isDirectory() && readdirSync(target).length === 0) {
+      rmdirSync(target);
+    }
+  } catch (error) { if (error?.code !== "ENOENT") throw error; }
+}
+
+function openCodeScopeIsGlobal(scope) {
+  return scope.opencode_scope === "user";
+}
+
+function openCodeScopeDirectory(scope) {
+  return openCodeScopeIsGlobal(scope)
+    ? path.dirname(path.dirname(scope.config.requested_path))
+    : path.join(scope.project, ".opencode");
+}
+
+function removeOwnedOpenCodeGitignore(scope, directory) {
+  if (!scope.gitignore_created) return;
+  const target = path.join(directory, ".gitignore");
+  try {
+    if (lstatSync(target).isFile() && readFileSync(target, "utf8") === "*\n") unlinkSync(target);
+  } catch (error) { if (error?.code !== "ENOENT") throw error; }
+}
+
+function uninstallOpenCodeDependency(scope, directory, snapshot = readOpenCodePackageJson(directory)) {
+  const { package_json_path: packageJsonPath, package_path: packagePath } = openCodePaths(directory, scope.plugin_name);
+  const foreignDependencies = plainObject(snapshot.value?.dependencies)
+    ? Object.keys(snapshot.value.dependencies).filter((name) => name !== scope.plugin_name) : [];
+  const removeGeneratedTree = scope.package_json_created && foreignDependencies.length === 0;
   if (snapshot.existed && plainObject(snapshot.value.dependencies) &&
       Object.hasOwn(snapshot.value.dependencies, scope.plugin_name)) {
     const managed = switchboardManagedOpenCodePackage(snapshot, scope.plugin_name, scope.plugin_spec);
@@ -811,10 +867,18 @@ function uninstallOpenCodeDependency(scope, snapshot = readOpenCodePackageJson(s
       plainObject(value.dependencies) && !Object.keys(value.dependencies).length;
     if (!managed) backup(packageJsonPath);
     if (scope.package_json_created && onlyEmptyDependencies) {
-      try { unlinkSync(packageJsonPath); } catch (error) { if (error?.code !== "ENOENT") throw error; }
+      removeFileIfPresent(packageJsonPath);
     } else atomicText(packageJsonPath, `${JSON.stringify(value, null, 2)}\n`, snapshot.mode);
   }
   rmSync(packagePath, { recursive: true, force: true });
+  if (removeGeneratedTree) {
+    removeFileIfPresent(path.join(directory, "package-lock.json"));
+    removeFileIfPresent(path.join(directory, "node_modules", ".package-lock.json"));
+    rmSync(path.join(directory, "node_modules"), { recursive: true, force: true });
+  }
+  removeOwnedOpenCodeGitignore(scope, directory);
+  removeEmptyDirectory(path.join(directory, "plugin"));
+  if (removeGeneratedTree && !openCodeScopeIsGlobal(scope)) removeEmptyDirectory(directory);
 }
 
 function preflightConfig(host, target, previous, plugin = DEFAULT_OPENCODE_PLUGIN) {
@@ -987,7 +1051,7 @@ function codexHookTrustStatus(scope, env) {
 }
 
 function installOne({ plan, repository, home, binPath, env, plugin }) {
-  const { host, project, paths, scope, previous, preflight } = plan;
+  const { host, project, projectOpenCode, paths, scope, previous, preflight } = plan;
   const state = plan.state;
   const credential = snapshotFile(paths.credential);
   state.transaction = {
@@ -1044,7 +1108,7 @@ function installOne({ plan, repository, home, binPath, env, plugin }) {
     injectAfterPhase(env, "credential_written");
 
     const packageRecord = host === "opencode"
-      ? installOpenCodeDependency(project, plugin, env, home, state, previous) : null;
+      ? installOpenCodeDependency(paths.opencode_directory, plugin, env, home, state, previous, projectOpenCode) : null;
     journalPhase(home, state, "package_installed", { package_skipped: host !== "opencode" });
     injectAfterPhase(env, "package_installed");
 
@@ -1103,20 +1167,26 @@ function installOne({ plan, repository, home, binPath, env, plugin }) {
     injectAfterPhase(env, "config_mutated");
 
     const verification = host === "opencode"
-      ? verifyOpenCode({ project, home, credentialPath: paths.credential, env, pluginName: plugin.name })
+      ? verifyOpenCode({
+        directory: paths.opencode_directory, project, home,
+        credentialPath: paths.credential, env, pluginName: plugin.name,
+      })
       : verifyHook({ host, repository, entryB64: installedEntryB64, env });
     if (!verification.startsWith("passed_")) throw new Error(`Coding seam verification failed: ${verification}`);
     journalPhase(home, state, "verified", { verification });
     injectAfterPhase(env, "verified");
 
     const row = {
-      host, scope_id: scope, project, client_id: client.client_id, entry_b64: installedEntryB64,
+      host, scope_id: scope, project: host === "opencode" && !projectOpenCode ? null : project,
+      client_id: client.client_id, entry_b64: installedEntryB64,
       config: installedIdentity, metadata, last_verification: verification, verified_at: new Date().toISOString(),
       ...(host === "codex" && codexTrust ? { codex_trust_key: codexTrust.stateKey } : {}),
       ...(host === "opencode" ? {
         plugin_name: plugin.name,
         plugin_spec: plugin.spec,
         package_json_created: previous?.package_json_created ?? packageRecord.package_json_created,
+        gitignore_created: Boolean(previous?.gitignore_created || packageRecord.gitignore_created),
+        opencode_scope: projectOpenCode ? "project" : "user",
       } : {}),
     };
     const committedScopes = state.scopes.map((installedScope) => ({ ...installedScope, client_id: client.client_id }));
@@ -1134,13 +1204,26 @@ function installOne({ plan, repository, home, binPath, env, plugin }) {
     writeState(home, state);
     injectAfterPhase(env, "commit_prepared");
     if (!finalizeTransactionCommit(repository, home, state, env)) throw recoveryError(state);
+    if (host === "opencode" && !projectOpenCode) {
+      const projectScopes = state.scopes.filter((installedScope) =>
+        installedScope.scope_id !== scope && !openCodeScopeIsGlobal(installedScope) &&
+        typeof installedScope.project === "string");
+      if (projectScopes.length) {
+        const commands = projectScopes.map((installedScope) =>
+          `switchboard coding uninstall --target opencode --project ${shellQuote(installedScope.project)}`);
+        process.stdout.write(`Existing OpenCode project scopes remain: ${commands.join("; ")}\n`);
+      }
+    }
     process.stdout.write(`${host}: client ${client.client_id}\n`);
     process.stdout.write(`categories: ${CODING_PROFILE_CATEGORIES.join(",")}\n`);
     if (host === "opencode") {
       process.stdout.write("OpenCode ambient memory and hand-offs are enabled. This install is the owner-present ceremony. Hosted fallback is disabled.\n");
     }
     process.stdout.write(`verification: ${verification}\n`);
-    process.stdout.write(`uninstall: switchboard coding uninstall --target ${host}\n`);
+    const projectUninstall = (host === "claude-code" && plan.projectClaude) ||
+      (host === "opencode" && projectOpenCode);
+    process.stdout.write(`uninstall: switchboard coding uninstall --target ${host}` +
+      `${projectUninstall ? ` --project ${shellQuote(project)}` : ""}\n`);
     if (host === "codex" && codexTrust) process.stdout.write(`hook trust: ${codexTrust.status}\n`);
   } catch (error) {
     if (state.transaction?.commit) finalizeTransactionCommit(repository, home, state, env);
@@ -1159,7 +1242,7 @@ function install({ args, repository, home, binPath, env }) {
   const discovered = discoverCodingHosts({ project, env });
   const targets = explicitTargets ?? (global ? ["claude-code"] : HOSTS.filter((host) => discovered[host]));
   if (!targets.length) throw new Error("No supported coding host was found");
-  if (global && targets.some((host) => host !== "claude-code")) throw new Error("Only Claude Code supports --global");
+  if (global && targets.includes("codex")) throw new Error("Only Claude Code and OpenCode support --global");
   const plugin = resolveOpenCodePlugin(option(args, "--opencode-plugin-tarball"));
 
   const failures = [];
@@ -1170,21 +1253,22 @@ function install({ args, repository, home, binPath, env }) {
       const hadState = existsSync(statePath(home, host));
       const state = readState(home, host);
       const projectClaude = host === "claude-code" && Boolean(projectOption) && !global;
-      const paths = hostPaths(host, { project, projectClaude, env });
+      const projectOpenCode = host === "opencode" && Boolean(projectOption) && !global;
+      const paths = hostPaths(host, { project, projectClaude, projectOpenCode, env });
       if (!hadState && existsSync(paths.credential)) {
         throw new Error("host credentials exist without install state; refusing to take ownership");
       }
-      const scope = scopeId(repository, host, { project, projectClaude });
+      const scope = scopeId(repository, host, { project, projectClaude, projectOpenCode });
       let previous = currentScope(state, scope);
-      if (host === "opencode") readOpenCodePackageJson(project);
+      if (host === "opencode") readOpenCodePackageJson(paths.opencode_directory);
       let preflight = preflightConfig(host, paths.config, previous, plugin);
 
       // Recovery is a mutation, but this host passed its own read-only preflight first.
       const recoveredState = recoverHost(repository, home, host);
       previous = currentScope(recoveredState, scope);
-      if (host === "opencode") readOpenCodePackageJson(project);
+      if (host === "opencode") readOpenCodePackageJson(paths.opencode_directory);
       preflight = preflightConfig(host, paths.config, previous, plugin);
-      plans.push({ host, project, projectClaude, paths, scope, previous, state: recoveredState, preflight });
+      plans.push({ host, project, projectClaude, projectOpenCode, paths, scope, previous, state: recoveredState, preflight });
     } catch (error) {
       failures.push({ host, message: String(error?.message ?? error).replace(/\s+/g, " ").trim() });
     }
@@ -1223,7 +1307,9 @@ function status({ args, repository, home, env }) {
       continue;
     }
     const scope = selectedScope(state, repository, host, {
-      project, projectClaude: host === "claude-code" && Boolean(projectOption),
+      project,
+      projectClaude: host === "claude-code" && Boolean(projectOption),
+      projectOpenCode: host === "opencode" && Boolean(projectOption),
     });
     const client = state.client_id
       ? repository.listClients().find((entry) => entry.client_id === state.client_id && !entry.revoked_at) : null;
@@ -1246,7 +1332,7 @@ function verifyInstalledScope({ host, scope, repository, home, env }) {
   catch { return "failed_credentials"; }
   return host === "opencode"
     ? verifyOpenCode({
-      project: scope.project, home, credentialPath, env,
+      directory: openCodeScopeDirectory(scope), project: scope.project, home, credentialPath, env,
       pluginName: scope.plugin_name ?? DEFAULT_OPENCODE_PLUGIN.name,
       legacy: !scope.plugin_name,
     })
@@ -1280,7 +1366,9 @@ function doctor({ args, repository, home, env }) {
       continue;
     }
     const scope = selectedScope(state, repository, host, {
-      project, projectClaude: host === "claude-code" && Boolean(projectOption),
+      project,
+      projectClaude: host === "claude-code" && Boolean(projectOption),
+      projectOpenCode: host === "opencode" && Boolean(projectOption),
     });
     let verification = "not_installed";
     let trust = null;
@@ -1311,6 +1399,7 @@ function uninstall({ args, repository, home, env }) {
   const projectOption = option(args, "--project");
   const project = path.resolve(projectOption ?? process.cwd());
   const projectClaude = host === "claude-code" && Boolean(projectOption) && !args.includes("--global");
+  const projectOpenCode = host === "opencode" && Boolean(projectOption) && !args.includes("--global");
   const state = readState(home, host, { required: true });
   if (state.transaction) {
     const recovered = state.transaction.commit
@@ -1318,7 +1407,7 @@ function uninstall({ args, repository, home, env }) {
       : rollbackTransaction(repository, home, state, env);
     if (!recovered) throw recoveryError(state);
   }
-  const scope = selectedScope(state, repository, host, { project, projectClaude });
+  const scope = selectedScope(state, repository, host, { project, projectClaude, projectOpenCode });
   if (!scope) throw new Error(STATE_REMEDIATION);
 
   // Resolve and validate everything before making the first change. State and config must agree exactly.
@@ -1332,9 +1421,11 @@ function uninstall({ args, repository, home, env }) {
   }
 
   if (host === "opencode") {
-    const packageSnapshot = readOpenCodePackageJson(scope.project);
+    const directory = openCodeScopeDirectory(scope);
+    const packageSnapshot = readOpenCodePackageJson(directory);
     unlinkSync(snapshot.identity.target_path);
-    if (scope.plugin_name) uninstallOpenCodeDependency(scope, packageSnapshot);
+    if (scope.plugin_name) uninstallOpenCodeDependency(scope, directory, packageSnapshot);
+    else removeEmptyDirectory(path.join(directory, "plugin"));
   }
   else {
     casJsonMutation(snapshot, (config) => mergeHookRemoval(config, scope), { env });

@@ -602,7 +602,7 @@ async function main(args = process.argv.slice(2)) {
       "project has no repository identity",
       "Run switchboard init first",
       "Use either --project or --global",
-      "Only Claude Code supports --global",
+      "Only Claude Code and OpenCode support --global",
       "No supported coding host was found",
       "invalid coding target",
       "host config must contain one JSON object",
