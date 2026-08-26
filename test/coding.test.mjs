@@ -415,7 +415,7 @@ test("OpenCode tarball rename recovery restores the replaced package directory",
   );
   assert.equal(crashed.status, 86, crashed.stderr);
   const transaction = stateFor(setup, "opencode").transaction;
-  assert.match(transaction.package.removed_package_backup_path, /one\.switchboard-backup-/);
+  assert.match(transaction.package.removed_package_backup_path, /\.removed-package-[0-9a-f]{16}\.switchboard-backup-/);
   assert.equal(existsSync(transaction.package.removed_package_backup_path), true);
   assert.equal(existsSync(path.join(setup.project, ".opencode", "node_modules", firstName)), false);
 

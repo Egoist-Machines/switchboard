@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync,
   readlinkSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync,
@@ -768,8 +768,9 @@ function installOpenCodeDependency(project, plugin, env, home, state, previous) 
   const removedPackagePath = removedPluginName
     ? openCodePaths(project, removedPluginName).package_path : null;
   if (removedPackagePath && existsSync(removedPackagePath)) {
+    const removedNameDigest = createHash("sha256").update(removedPluginName, "utf8").digest("hex").slice(0, 16);
     record.removed_package_backup_path = backupPath(
-      path.join(directory, `.removed-package-${removedPluginName.replaceAll("/", "__")}`));
+      path.join(directory, `.removed-package-${removedNameDigest}`));
     journalPhase(home, state, "package_reconciliation_prepared", { package: record });
     renameSync(removedPackagePath, record.removed_package_backup_path);
     injectAfterMutation(env, "package_reconciliation");
