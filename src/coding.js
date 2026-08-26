@@ -9,6 +9,10 @@ import path from "node:path";
 import process from "node:process";
 
 import { CODING_PROFILE_CATEGORIES, SCHEMA_VERSION } from "./constants.js";
+import {
+  codexHookStateKey, codexHookTrustedHash, findSwitchboardHookIndices,
+  readTrustEntry, removeTrustEntry, upsertTrustEntry,
+} from "./codexTrust.js";
 import { hostCredentialPath, loadHostCredentials } from "./hook.js";
 
 const HOSTS = Object.freeze(["opencode", "claude-code", "codex"]);
@@ -39,6 +43,12 @@ const OPENCODE_ENTRY = opencodeEntry(DEFAULT_OPENCODE_PLUGIN.name);
 
 function ownerHome(env = process.env) {
   return typeof env.HOME === "string" && env.HOME.trim() ? path.resolve(env.HOME) : os.homedir();
+}
+
+function codexUserConfigPath(env = process.env) {
+  const codexHome = typeof env.CODEX_HOME === "string" && env.CODEX_HOME.trim()
+    ? env.CODEX_HOME : path.join(ownerHome(env), ".codex");
+  return path.join(codexHome, "config.toml");
 }
 
 function statePath(home, host) {
@@ -803,6 +813,75 @@ function finalizeTransactionCommit(repository, home, state, env = process.env) {
   return true;
 }
 
+function recordCodexHookTrust({ hooksJsonPath, entryB64, previous, env }) {
+  const snapshot = configSnapshot(hooksJsonPath);
+  if (!snapshot.existed) throw new Error("hooks.json was not found after installation");
+  const indices = findSwitchboardHookIndices(snapshot.body, entryB64);
+  if (!indices) throw new Error("the Switchboard hook was not found after installation");
+  const stateKey = codexHookStateKey(snapshot.identity.requested_path, indices.groupIndex, indices.handlerIndex);
+  const trustedHash = codexHookTrustedHash(indices.handler);
+  const configPath = codexUserConfigPath(env);
+  let original = "";
+  let mode = 0o600;
+  let existed = false;
+  try {
+    original = readFileSync(configPath, "utf8");
+    mode = statSync(configPath).mode & 0o777;
+    existed = true;
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  let next = original;
+  if (previous?.codex_trust_key && previous.codex_trust_key !== stateKey) {
+    next = removeTrustEntry(next, previous.codex_trust_key);
+  }
+  const alreadyRecorded = readTrustEntry(next, stateKey) === trustedHash;
+  if (!alreadyRecorded) next = upsertTrustEntry(next, stateKey, trustedHash);
+  if (next !== original) {
+    if (existed) backup(configPath);
+    atomicText(configPath, next, mode);
+  }
+  return { stateKey, status: alreadyRecorded && next === original ? "already recorded" : "recorded" };
+}
+
+function clearCodexHookTrust(scope, env) {
+  if (!scope.codex_trust_key) return;
+  const configPath = codexUserConfigPath(env);
+  let original;
+  let mode;
+  try {
+    original = readFileSync(configPath, "utf8");
+    mode = statSync(configPath).mode & 0o777;
+  } catch (error) {
+    if (error?.code === "ENOENT") return;
+    throw error;
+  }
+  const next = removeTrustEntry(original, scope.codex_trust_key);
+  if (next === original) return;
+  backup(configPath);
+  atomicText(configPath, next, mode);
+}
+
+function codexHookTrustStatus(scope, env) {
+  let snapshot;
+  let indices;
+  try {
+    snapshot = configSnapshot(scope.config.requested_path);
+    if (!snapshot.existed || !sameIdentity(snapshot.identity, scope.config)) return "unknown";
+    indices = findSwitchboardHookIndices(snapshot.body, scope.entry_b64);
+    if (!indices) return "unknown";
+  } catch { return "unknown"; }
+  const stateKey = codexHookStateKey(snapshot.identity.requested_path, indices.groupIndex, indices.handlerIndex);
+  const trustedHash = codexHookTrustedHash(indices.handler);
+  let configToml;
+  try { configToml = readFileSync(codexUserConfigPath(env), "utf8"); }
+  catch (error) { return error?.code === "ENOENT" ? "missing" : "unknown"; }
+  if (typeof scope.codex_trust_key === "string" && scope.codex_trust_key !== stateKey) return "stale";
+  const recordedHash = readTrustEntry(configToml, stateKey);
+  if (recordedHash === null) return "missing";
+  return recordedHash === trustedHash ? "ok" : "stale";
+}
+
 function installOne({ plan, repository, home, binPath, env, plugin }) {
   const { host, project, paths, scope, previous, preflight } = plan;
   const state = plan.state;
@@ -906,6 +985,17 @@ function installOne({ plan, repository, home, binPath, env, plugin }) {
       }
     }
     journalPhase(home, state, "config_mutated");
+    let codexTrust = null;
+    if (host === "codex") {
+      try {
+        codexTrust = recordCodexHookTrust({
+          hooksJsonPath: paths.config, entryB64: installedEntryB64, previous, env,
+        });
+      } catch (error) {
+        const reason = String(error?.message ?? error).replace(/\.+$/, "").replace(/\s+/g, " ").trim();
+        process.stderr.write(`codex: hook trust could not be recorded: ${reason}. Open codex in this project and trust the hook via /hooks.\n`);
+      }
+    }
     injectAfterPhase(env, "config_mutated");
 
     const verification = host === "opencode"
@@ -918,6 +1008,7 @@ function installOne({ plan, repository, home, binPath, env, plugin }) {
     const row = {
       host, scope_id: scope, project, client_id: client.client_id, entry_b64: installedEntryB64,
       config: installedIdentity, metadata, last_verification: verification, verified_at: new Date().toISOString(),
+      ...(host === "codex" && codexTrust ? { codex_trust_key: codexTrust.stateKey } : {}),
       ...(host === "opencode" ? {
         plugin_name: plugin.name,
         plugin_spec: plugin.spec,
@@ -946,6 +1037,7 @@ function installOne({ plan, repository, home, binPath, env, plugin }) {
     }
     process.stdout.write(`verification: ${verification}\n`);
     process.stdout.write(`uninstall: switchboard coding uninstall --target ${host}\n`);
+    if (host === "codex" && codexTrust) process.stdout.write(`hook trust: ${codexTrust.status}\n`);
   } catch (error) {
     if (state.transaction?.commit) finalizeTransactionCommit(repository, home, state, env);
     else if (!rollbackTransaction(repository, home, state, env)) throw recoveryError(state);
@@ -1017,7 +1109,7 @@ function exactConfigPresent(host, scope) {
   } catch { return false; }
 }
 
-function status({ args, repository, home }) {
+function status({ args, repository, home, env }) {
   const projectOption = option(args, "--project");
   const project = path.resolve(projectOption ?? process.cwd());
   for (const host of HOSTS) {
@@ -1035,9 +1127,10 @@ function status({ args, repository, home }) {
     const present = scope ? exactConfigPresent(host, scope) : false;
     const installed = scope ? "yes" : state.scopes.length
       ? `no (${state.scopes.length} other scope${state.scopes.length === 1 ? "" : "s"})` : "no";
+    const trust = host === "codex" && scope ? codexHookTrustStatus(scope, env) : null;
     process.stdout.write(`${host}: installed=${installed} client=${client?.client_id ?? "none"} ` +
       `grants=${grants.join(",") || "none"} config=${present ? "present" : "absent"} ` +
-      `verification=${scope?.last_verification ?? "not_run"}\n`);
+      `verification=${scope?.last_verification ?? "not_run"}${trust ? ` hook_trust=${trust}` : ""}\n`);
   }
   return 0;
 }
@@ -1086,16 +1179,23 @@ function doctor({ args, repository, home, env }) {
       project, projectClaude: host === "claude-code" && Boolean(projectOption),
     }));
     let verification = "not_installed";
+    let trust = null;
     if (scope) {
       verification = verifyInstalledScope({ host, scope, repository, home, env });
+      if (host === "codex") trust = codexHookTrustStatus(scope, env);
       scope.last_verification = verification;
       scope.verified_at = new Date().toISOString();
       writeState(home, state);
-      if (!verification.startsWith("passed_")) healthy = false;
+      if (!verification.startsWith("passed_") || (trust && trust !== "ok")) healthy = false;
     }
-    process.stdout.write(`${host}: discovered=${discovered[host] ? "yes" : "no"} verification=${verification}\n`);
-    if (verification !== "not_installed" && !verification.startsWith("passed_")) {
+    process.stdout.write(`${host}: discovered=${discovered[host] ? "yes" : "no"} verification=${verification}` +
+      `${trust ? ` hook_trust=${trust}` : ""}\n`);
+    if (verification !== "not_installed" &&
+        (!verification.startsWith("passed_") || (trust && trust !== "ok"))) {
       process.stdout.write(`remediation: switchboard coding install --targets ${host}${projectOption ? " --project ." : ""}\n`);
+    }
+    if (trust === "missing" || trust === "stale") {
+      process.stdout.write("or open codex in this project and trust the hook via /hooks.\n");
     }
   }
   return healthy ? 0 : 1;
@@ -1132,7 +1232,10 @@ function uninstall({ args, repository, home, env }) {
     unlinkSync(snapshot.identity.target_path);
     if (scope.plugin_name) uninstallOpenCodeDependency(scope);
   }
-  else casJsonMutation(snapshot, (config) => mergeHookRemoval(config, scope), { env });
+  else {
+    casJsonMutation(snapshot, (config) => mergeHookRemoval(config, scope), { env });
+    if (host === "codex") clearCodexHookTrust(scope, env);
+  }
   state.scopes = state.scopes.filter((entry) => entry.scope_id !== scopeIdValue);
   const last = state.scopes.length === 0;
   const keepClient = args.includes("--keep-client");
@@ -1153,7 +1256,7 @@ function uninstall({ args, repository, home, env }) {
 export function runCodingCommand({ args, repository, home, binPath, env = process.env } = {}) {
   const action = args[1];
   if (action === "install") return install({ args: args.slice(2), repository, home, binPath, env });
-  if (action === "status") return status({ args: args.slice(2), repository, home });
+  if (action === "status") return status({ args: args.slice(2), repository, home, env });
   if (action === "doctor") return doctor({ args: args.slice(2), repository, home, env });
   if (action === "uninstall") return uninstall({ args: args.slice(2), repository, home, env });
   throw new Error("coding requires install, status, doctor, or uninstall");

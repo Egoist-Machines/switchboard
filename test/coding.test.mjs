@@ -7,6 +7,10 @@ import test from "node:test";
 import Database from "better-sqlite3";
 
 import { DEFAULT_OPENCODE_PLUGIN, discoverCodingHosts, opencodeEntry } from "../src/coding.js";
+import {
+  codexHookStateKey, codexHookTrustedHash, findSwitchboardHookIndices,
+  readTrustEntry, removeTrustEntry, upsertTrustEntry,
+} from "../src/codexTrust.js";
 import { formatHookMemoryBlock } from "../src/hook.js";
 import { LocalRepository } from "../src/repository.js";
 import { resolveProjectScope } from "../src/projectIdentity.js";
@@ -442,6 +446,65 @@ test("coding status shows other installed scopes", (t) => {
   const status = setup.run(["coding", "status", "--project", otherProject]);
   assert.equal(status.status, 0, status.stderr);
   assert.match(status.stdout, /codex: installed=no \(1 other scope\)/);
+});
+
+test("Codex install records trust at the exact hook indices and doctor repairs it", (t) => {
+  const setup = fixture(t);
+  hostStub(setup.bin, "codex");
+  const hooksPath = path.join(setup.project, ".codex", "hooks.json");
+  const trustPath = path.join(setup.ownerHome, ".codex", "config.toml");
+  const foreignKey = "/foreign/.codex/hooks.json:user_prompt_submit:0:0";
+  mkdirSync(path.dirname(hooksPath), { recursive: true });
+  mkdirSync(path.dirname(trustPath), { recursive: true });
+  writeFileSync(hooksPath, `${JSON.stringify({
+    hooks: { UserPromptSubmit: [{ hooks: [{ type: "command", command: "foreign-hook" }] }] },
+  }, null, 2)}\n`);
+  writeFileSync(trustPath, upsertTrustEntry("model = \"gpt-5\"\n", foreignKey, "sha256:foreign"));
+  assert.equal(setup.run(["init"]).status, 0);
+
+  const install = setup.run(["coding", "install", "--targets", "codex", "--project", setup.project]);
+  assert.equal(install.status, 0, install.stderr);
+  assert.match(install.stdout, /hook trust: recorded/);
+  const hooks = JSON.parse(readFileSync(hooksPath, "utf8"));
+  const scope = stateFor(setup, "codex").scopes[0];
+  const indices = findSwitchboardHookIndices(hooks, scope.entry_b64);
+  assert.deepEqual({ groupIndex: indices.groupIndex, handlerIndex: indices.handlerIndex }, { groupIndex: 1, handlerIndex: 0 });
+  const trustKey = codexHookStateKey(hooksPath, indices.groupIndex, indices.handlerIndex);
+  assert.equal(scope.codex_trust_key, trustKey);
+  assert.equal(readTrustEntry(readFileSync(trustPath, "utf8"), trustKey), codexHookTrustedHash(indices.handler));
+  assert.equal(readTrustEntry(readFileSync(trustPath, "utf8"), foreignKey), "sha256:foreign");
+
+  const status = setup.run(["coding", "status", "--project", setup.project]);
+  assert.match(status.stdout, /codex: .*hook_trust=ok/);
+  assert.equal(setup.run(["coding", "doctor", "--project", setup.project]).status, 0);
+
+  writeFileSync(trustPath, removeTrustEntry(readFileSync(trustPath, "utf8"), trustKey));
+  const missing = setup.run(["coding", "doctor", "--project", setup.project]);
+  assert.equal(missing.status, 1, missing.stderr);
+  assert.match(missing.stdout, /hook_trust=missing/);
+  assert.match(missing.stdout, /remediation: switchboard coding install --targets codex --project \./);
+  assert.match(missing.stdout, /or open codex in this project and trust the hook via \/hooks\./);
+
+  assert.equal(setup.run(["coding", "install", "--targets", "codex", "--project", setup.project]).status, 0);
+  assert.equal(setup.run(["coding", "doctor", "--project", setup.project]).status, 0);
+  const uninstall = setup.run(["coding", "uninstall", "--target", "codex", "--project", setup.project]);
+  assert.equal(uninstall.status, 0, uninstall.stderr);
+  const afterUninstall = readFileSync(trustPath, "utf8");
+  assert.equal(readTrustEntry(afterUninstall, trustKey), null);
+  assert.equal(readTrustEntry(afterUninstall, foreignKey), "sha256:foreign");
+});
+
+test("Codex install succeeds when user hook trust cannot be written", (t) => {
+  const setup = fixture(t);
+  hostStub(setup.bin, "codex");
+  const codexHome = path.join(setup.ownerHome, ".codex");
+  mkdirSync(codexHome, { recursive: true });
+  chmodSync(codexHome, 0o500);
+  assert.equal(setup.run(["init"]).status, 0);
+  const install = setup.run(["coding", "install", "--targets", "codex", "--project", setup.project]);
+  chmodSync(codexHome, 0o700);
+  assert.equal(install.status, 0, install.stderr);
+  assert.match(install.stderr, /codex: hook trust could not be recorded: .* Open codex in this project and trust the hook via \/hooks\./);
 });
 
 test("OpenCode install uses the packed plugin local transport and writes owner-present options", { skip: !hasOpencodeSibling }, (t) => {
