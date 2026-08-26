@@ -24,7 +24,17 @@ jobs:
       - run: npm test
         working-directory: packages/opencode-switchboard
       - run: npm install -g npm@11
-      - run: npm publish --provenance --access public
+      - name: Publish switchboard when its version is new
+        run: |
+          version=$(node -p "require('./package.json').version")
+          if output=$(npm view "@egoistmachines/switchboard@${version}" version 2>&1); then
+            echo "switchboard ${version} is already published"
+          elif printf '%s' "$output" | grep -q 'E404'; then
+            npm publish --provenance --access public
+          else
+            printf '%s\n' "$output"
+            exit 1
+          fi
       - name: Publish the OpenCode plugin when its version is new
         working-directory: packages/opencode-switchboard
         run: |
