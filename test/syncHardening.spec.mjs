@@ -27,6 +27,24 @@ function emptyPage(cursor = "0") {
   };
 }
 
+function fencePage(cursor = "1") {
+  return {
+    ...emptyPage(cursor),
+    fences: [{
+      change_seq: cursor,
+      entity_id: "83000000-0000-4000-8000-000000000001",
+      hosted_proposal_id: null,
+      hosted_memory_id: null,
+      lifecycle_state: "fenced",
+      category: null,
+      origin_connector: null,
+      deletion_fence_id: null,
+      deleted_entity_version: null,
+      occurred_at: "2026-08-26T12:00:00.000Z",
+    }],
+  };
+}
+
 function link(repository) {
   writeHostedLink(repository.home, {
     base_url: "https://passport.example",
@@ -216,6 +234,40 @@ test("upload_seq must match the last claimed outcome", async (t) => {
   `).get().count, 3);
 });
 
+for (const [name, response] of [
+  ["invalid JSON", () => new Response("{", { status: 200, headers: { "content-type": "application/json" } })],
+  ["an empty object", () => jsonResponse({})],
+  ["an outcome array without upload_seq", () => jsonResponse({ outcomes: [] })],
+]) {
+  test(`a 200 upload response with ${name} is invalid_response`, async (t) => {
+    const repository = await repositoryFixture(t);
+    addPendingProposals(repository, 3);
+    let offered = [];
+    const fetchImpl = cycleFetch((call) => {
+      offered = call.body.events.map((event) => event.event_id);
+      return response();
+    });
+
+    const result = await syncOnce({ repository, fetchImpl });
+    assert.equal(result.status, "invalid_response");
+    assert.equal(result.pending, offered.length);
+    assert.equal(offered.length, 3);
+    assert.deepEqual(repository.db.prepare(`
+      SELECT event_id, state FROM hosted_sync_uploads ORDER BY upload_seq
+    `).all(), offered.map((eventId) => ({ event_id: eventId, state: "pending" })));
+  });
+}
+
+test("pending upload count uses the partial pending index", async (t) => {
+  const repository = await repositoryFixture(t);
+  const key = repository.db.prepare("SELECT link_key FROM hosted_sync_state").get().link_key;
+  const plan = repository.db.prepare(`
+    EXPLAIN QUERY PLAN
+    SELECT count(*) AS count FROM hosted_sync_uploads WHERE link_key = ? AND state = 'pending'
+  `).all(key).map((row) => row.detail).join("\n");
+  assert.match(plan, /hosted_sync_uploads_pending/);
+});
+
 test("cursor reconciliation adopts a fully applied gap and continues pulling", async (t) => {
   const repository = await repositoryFixture(t);
   const key = repository.db.prepare("SELECT link_key FROM hosted_sync_state").get().link_key;
@@ -269,8 +321,63 @@ test("cursor reconciliation fails closed when an applied change is missing", asy
   assert.deepEqual(result.failure_detail, { local_cursor: "0", server_cursor: "3" });
   assert.equal(
     syncFailureMessage(result),
-    "Hosted sync cursors have diverged (local 0, server 3). Run switchboard sync --replay-from 0 or contact support.",
+    "Hosted sync cursors have diverged (local 0, server 3). Hosted sync stays paused. Unlink and relink this device to re-bootstrap from the hosted snapshot, or contact support.",
   );
+});
+
+test("equal local and server cursors in a 409 stay sync_refused", async (t) => {
+  const repository = await repositoryFixture(t);
+  const fetchImpl = scriptedFetch((call) => {
+    if (call.url.includes("/sync/v1/changes?cursor=0")) {
+      return jsonResponse({ error: "cursor_not_current", cursor: "0" }, 409);
+    }
+    throw new Error("unexpected request");
+  });
+
+  const result = await syncOnce({ repository, fetchImpl });
+  assert.equal(result.status, "sync_refused");
+  assert.equal(result.new_cursor, "0");
+  assert.equal(fetchImpl.calls.length, 1);
+});
+
+test("a lost acknowledgement reconciles the applied page on the next sync", async (t) => {
+  const repository = await repositoryFixture(t, { bootstrap: false });
+  let cycle = 1;
+  let reconciliationOffered = false;
+  let acknowledgements = 0;
+  const fetchImpl = scriptedFetch((call) => {
+    if (call.url.endsWith("/sync/v1/snapshot")) {
+      if (cycle === 1) return jsonResponse(fencePage());
+      if (!reconciliationOffered) {
+        reconciliationOffered = true;
+        return jsonResponse({ error: "cursor_not_current", cursor: "1" }, 409);
+      }
+      return jsonResponse(emptyPage("1"));
+    }
+    if (call.url.endsWith("/sync/v1/ack")) {
+      acknowledgements += 1;
+      if (cycle === 1) throw new Error("ack response lost");
+      return jsonResponse({ ok: true, cursor: call.body.cursor });
+    }
+    throw new Error("unexpected request");
+  });
+
+  const first = await syncOnce({ repository, fetchImpl });
+  assert.equal(first.status, "network_failure");
+  assert.equal(first.applied, 1);
+  assert.equal(first.new_cursor, "0");
+  assert.equal(repository.db.prepare(`
+    SELECT count(*) AS count FROM hosted_sync_changes WHERE change_seq = '1'
+  `).get().count, 1);
+  assert.equal(acknowledgements, 2);
+
+  cycle = 2;
+  const second = await syncOnce({ repository, fetchImpl });
+  assert.equal(second.status, "ok");
+  assert.equal(second.new_cursor, "1");
+  assert.equal(second.applied, 0);
+  assert.equal(acknowledgements, 3);
+  assert.equal(repository.db.prepare("SELECT bootstrap_complete FROM hosted_sync_state").get().bootstrap_complete, 1);
 });
 
 test("acknowledgement retries one server error and succeeds", async (t) => {
@@ -283,6 +390,23 @@ test("acknowledgement retries one server error and succeeds", async (t) => {
       return acknowledgements === 1
         ? jsonResponse({ error: "temporary" }, 503)
         : jsonResponse({ ok: true, cursor: call.body.cursor });
+    }
+    throw new Error("unexpected request");
+  });
+
+  assert.equal((await syncOnce({ repository, fetchImpl })).status, "ok");
+  assert.equal(acknowledgements, 2);
+});
+
+test("acknowledgement retries one network failure and succeeds", async (t) => {
+  const repository = await repositoryFixture(t, { bootstrap: false });
+  let acknowledgements = 0;
+  const fetchImpl = scriptedFetch((call) => {
+    if (call.url.endsWith("/sync/v1/snapshot")) return jsonResponse(emptyPage());
+    if (call.url.endsWith("/sync/v1/ack")) {
+      acknowledgements += 1;
+      if (acknowledgements === 1) throw new Error("temporary network failure");
+      return jsonResponse({ ok: true, cursor: call.body.cursor });
     }
     throw new Error("unexpected request");
   });
@@ -335,7 +459,7 @@ test("sync failure messages distinguish transport failures", () => {
   assert.equal(syncFailureMessage({
     status: "cursor_desync",
     failure_detail: { local_cursor: "4", server_cursor: "2" },
-  }), "Hosted sync cursors have diverged (local 4, server 2). Run switchboard sync --replay-from 4 or contact support.");
+  }), "Hosted sync cursors have diverged (local 4, server 2). Hosted sync stays paused. Unlink and relink this device to re-bootstrap from the hosted snapshot, or contact support.");
 });
 
 test("content_rejected exposes local item metadata without changing conflict accounting", async (t) => {

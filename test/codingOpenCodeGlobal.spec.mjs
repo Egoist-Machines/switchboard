@@ -44,8 +44,8 @@ function fixture(t, { xdg = false } = {}) {
   };
 }
 
-function hostStub(directory) {
-  const target = path.join(directory, "opencode");
+function hostStub(directory, name = "opencode") {
+  const target = path.join(directory, name);
   writeFileSync(target, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
   chmodSync(target, 0o755);
 }
@@ -59,7 +59,6 @@ printf '%s\\n' '{"type":"module"}' > "$PWD/node_modules/${pluginName}/package.js
 printf '%s\\n' 'export function createLocalTransport() { return { prefetch: async () => ({ status: "results" }) }; }' > "$PWD/node_modules/${pluginName}/src/localTransport.js"
 printf '%s\\n' transitive > "$PWD/node_modules/transitive-package/index.js"
 printf '%s\\n' internal-lock > "$PWD/node_modules/.package-lock.json"
-printf '%s\\n' top-lock > "$PWD/package-lock.json"
 `, { mode: 0o755 });
   chmodSync(target, 0o755);
 }
@@ -71,9 +70,9 @@ function prepare(setup) {
   assert.equal(initialized.status, 0, initialized.stderr);
 }
 
-function stateFor(setup) {
+function stateFor(setup, host = "opencode") {
   return JSON.parse(readFileSync(
-    path.join(setup.switchboardHome, "coding-installations", "opencode.json"), "utf8",
+    path.join(setup.switchboardHome, "coding-installations", `${host}.json`), "utf8",
   ));
 }
 
@@ -134,12 +133,13 @@ test("OpenCode --project keeps the project layout and a fully owned uninstall re
   assert.equal(installed.status, 0, installed.stderr);
   const directory = path.join(setup.project, ".opencode");
   assert.equal(readFileSync(path.join(directory, ".gitignore"), "utf8"), "*\n");
-  assert.equal(existsSync(path.join(directory, "package-lock.json")), true);
+  assert.equal(existsSync(path.join(directory, "package-lock.json")), false);
   assert.equal(existsSync(path.join(directory, "node_modules", ".package-lock.json")), true);
   assert.equal(existsSync(path.join(directory, "node_modules", "transitive-package")), true);
   const scope = stateFor(setup).scopes[0];
   assert.equal(scope.scope_id, expectedScopeId(setup, `coding-install:opencode:project:${setup.project}`));
   assert.equal(scope.opencode_scope, "project");
+  assert.equal(scope.node_modules_created, true);
   assert.equal(scope.gitignore_created, true);
 
   const uninstalled = setup.run([
@@ -159,6 +159,7 @@ test("global OpenCode merges foreign package state and conservative uninstall ke
   mkdirSync(path.join(directory, "node_modules", "foreign-package"), { recursive: true });
   writeFileSync(path.join(directory, "opencode.jsonc"), opencodeJsonc);
   writeFileSync(path.join(directory, "auth.json"), authBody);
+  writeFileSync(path.join(directory, "package-lock.json"), "owner-lock\n");
   writeFileSync(path.join(directory, "node_modules", "foreign-package", "index.js"), "foreign\n");
   writeFileSync(packageJsonPath, `${JSON.stringify({
     private: true, dependencies: { "foreign-package": "1.0.0" },
@@ -176,6 +177,7 @@ test("global OpenCode merges foreign package state and conservative uninstall ke
   assert.equal(readFileSync(path.join(directory, "opencode.jsonc"), "utf8"), opencodeJsonc);
   assert.equal(readFileSync(path.join(directory, "auth.json"), "utf8"), authBody);
   assert.equal(stateFor(setup).scopes[0].package_json_created, false);
+  assert.equal(stateFor(setup).scopes[0].node_modules_created, false);
   assert.equal(readdirSync(directory).some((name) => name.startsWith("package.json.switchboard-backup-")), true);
 
   const uninstalled = setup.run(["coding", "uninstall", "--target", "opencode"]);
@@ -202,6 +204,9 @@ test("fully owned global uninstall removes installer artifacts but never the con
   writeFileSync(path.join(directory, "opencode.jsonc"), opencodeJsonc);
   writeFileSync(path.join(directory, "session-auth"), "retained\n");
   assert.equal(setup.run(["coding", "install", "--targets", "opencode"]).status, 0);
+  assert.equal(stateFor(setup).scopes[0].node_modules_created, true);
+  assert.equal(setup.run(["coding", "install", "--targets", "opencode"]).status, 0);
+  assert.equal(stateFor(setup).scopes[0].node_modules_created, true);
 
   const uninstalled = setup.run(["coding", "uninstall", "--target", "opencode"]);
   assert.equal(uninstalled.status, 0, uninstalled.stderr);
@@ -212,6 +217,67 @@ test("fully owned global uninstall removes installer artifacts but never the con
   assert.equal(existsSync(path.join(directory, "package-lock.json")), false);
   assert.equal(existsSync(path.join(directory, "node_modules")), false);
   assert.equal(existsSync(path.join(directory, "plugin")), false);
+});
+
+test("generated manifest with a later dev dependency keeps owner package artifacts", (t) => {
+  const setup = fixture(t, { xdg: true });
+  prepare(setup);
+  const directory = globalConfigDirectory(setup);
+  const packageJsonPath = path.join(directory, "package.json");
+  assert.equal(setup.run(["coding", "install", "--targets", "opencode"]).status, 0);
+  assert.equal(stateFor(setup).scopes[0].package_json_created, true);
+  assert.equal(stateFor(setup).scopes[0].node_modules_created, true);
+
+  const manifest = JSON.parse(readFileSync(packageJsonPath, "utf8"));
+  manifest.devDependencies = { "owner-tool": "2.0.0" };
+  writeFileSync(packageJsonPath, `${JSON.stringify(manifest, null, 2)}\n`);
+  mkdirSync(path.join(directory, "node_modules", "owner-tool"), { recursive: true });
+  writeFileSync(path.join(directory, "node_modules", "owner-tool", "index.js"), "owner\n");
+  writeFileSync(path.join(directory, "package-lock.json"), "owner-lock\n");
+
+  const uninstalled = setup.run(["coding", "uninstall", "--target", "opencode"]);
+  assert.equal(uninstalled.status, 0, uninstalled.stderr);
+  assert.deepEqual(JSON.parse(readFileSync(packageJsonPath, "utf8")), {
+    dependencies: {},
+    devDependencies: { "owner-tool": "2.0.0" },
+  });
+  assert.equal(readFileSync(path.join(directory, "package-lock.json"), "utf8"), "owner-lock\n");
+  assert.equal(readFileSync(path.join(directory, "node_modules", "owner-tool", "index.js"), "utf8"), "owner\n");
+  assert.equal(existsSync(path.join(directory, "node_modules", "transitive-package")), true);
+  assert.equal(existsSync(path.join(directory, "node_modules", DEFAULT_OPENCODE_PLUGIN.name)), false);
+});
+
+test("pre-existing node_modules is recorded as foreign and kept on uninstall", (t) => {
+  const setup = fixture(t, { xdg: true });
+  prepare(setup);
+  const directory = globalConfigDirectory(setup);
+  mkdirSync(path.join(directory, "node_modules", "owner-cache"), { recursive: true });
+  writeFileSync(path.join(directory, "node_modules", "owner-cache", "sentinel"), "owner\n");
+
+  assert.equal(setup.run(["coding", "install", "--targets", "opencode"]).status, 0);
+  assert.equal(stateFor(setup).scopes[0].node_modules_created, false);
+  const uninstalled = setup.run(["coding", "uninstall", "--target", "opencode"]);
+  assert.equal(uninstalled.status, 0, uninstalled.stderr);
+  assert.equal(existsSync(path.join(directory, "package.json")), false);
+  assert.equal(readFileSync(path.join(directory, "node_modules", "owner-cache", "sentinel"), "utf8"), "owner\n");
+  assert.equal(existsSync(path.join(directory, "node_modules", DEFAULT_OPENCODE_PLUGIN.name)), false);
+});
+
+test("legacy OpenCode scope without node_modules ownership keeps the tree", (t) => {
+  const setup = fixture(t, { xdg: true });
+  prepare(setup);
+  const directory = globalConfigDirectory(setup);
+  assert.equal(setup.run(["coding", "install", "--targets", "opencode"]).status, 0);
+  const state = stateFor(setup);
+  delete state.scopes[0].node_modules_created;
+  writeState(setup, state);
+
+  const uninstalled = setup.run(["coding", "uninstall", "--target", "opencode"]);
+  assert.equal(uninstalled.status, 0, uninstalled.stderr);
+  assert.equal(existsSync(path.join(directory, "package.json")), false);
+  assert.equal(existsSync(path.join(directory, "node_modules")), true);
+  assert.equal(existsSync(path.join(directory, "node_modules", "transitive-package")), true);
+  assert.equal(existsSync(path.join(directory, "node_modules", DEFAULT_OPENCODE_PLUGIN.name)), false);
 });
 
 test("project install never clobbers or removes a pre-existing .gitignore", (t) => {
@@ -295,4 +361,22 @@ test("OpenCode --global is accepted and reports retained project scopes", (t) =>
   const fallback = setup.run(["coding", "uninstall", "--target", "opencode"]);
   assert.equal(fallback.status, 0, fallback.stderr);
   assert.equal(existsSync(path.join(project, ".opencode")), false);
+});
+
+test("coding install --global selects discovered Claude Code and OpenCode hosts", (t) => {
+  const setup = fixture(t, { xdg: true });
+  prepare(setup);
+  hostStub(setup.bin, "claude");
+  hostStub(setup.bin, "codex");
+
+  const installed = setup.run(["coding", "install", "--global"]);
+  assert.equal(installed.status, 0, installed.stderr);
+  assert.equal((installed.stdout.match(/verification: passed_/g) ?? []).length, 2);
+  assert.equal(stateFor(setup, "claude-code").scopes.length, 1);
+  assert.equal(stateFor(setup, "opencode").scopes.length, 1);
+  assert.equal(existsSync(path.join(setup.switchboardHome, "coding-installations", "codex.json")), false);
+
+  const codex = setup.run(["coding", "install", "--targets", "codex", "--global"]);
+  assert.equal(codex.status, 2);
+  assert.equal(codex.stderr, "Only Claude Code and OpenCode support --global\n");
 });

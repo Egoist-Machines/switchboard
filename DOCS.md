@@ -490,7 +490,10 @@ refused the sync request. `ack_refused` means it refused the cursor
 acknowledgement. `invalid_response` means the response shape was not recognized.
 `pull_required_loop` means push remained fenced behind repeated pulls.
 `hosted_unavailable` means the hosted plane returned server errors.
-`cursor_desync` means the local and server cursors cannot be reconciled safely.
+`cursor_desync` means the hosted cursor moved past changes this device never
+recorded. The client fails closed and leaves local memories unaffected. Unlink
+and relink the device to re-bootstrap from the hosted snapshot under a fresh
+device identity, or contact support.
 Network failure, device approval, and client upgrade failures remain
 `network_failure`, `not_approved`, and `upgrade_required`.
 

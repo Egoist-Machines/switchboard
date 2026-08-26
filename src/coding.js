@@ -78,6 +78,7 @@ function validScope(value) {
     (!Object.hasOwn(value, "plugin_name") || (typeof value.plugin_name === "string" && value.plugin_name)) &&
     (!Object.hasOwn(value, "plugin_spec") || (typeof value.plugin_spec === "string" && value.plugin_spec)) &&
     (!Object.hasOwn(value, "package_json_created") || typeof value.package_json_created === "boolean") &&
+    (!Object.hasOwn(value, "node_modules_created") || typeof value.node_modules_created === "boolean") &&
     (!Object.hasOwn(value, "gitignore_created") || typeof value.gitignore_created === "boolean") &&
     (!Object.hasOwn(value, "opencode_scope") || ["user", "project"].includes(value.opencode_scope));
 }
@@ -764,6 +765,7 @@ function verifyOpenCode({ directory, project, home, credentialPath, env,
 function installOpenCodeDependency(directory, plugin, env, home, state, previous, projectInstall) {
   const snapshot = readOpenCodePackageJson(directory);
   const { package_json_path: packageJsonPath, package_path: packagePath } = openCodePaths(directory, plugin.name);
+  const nodeModulesCreated = !existsSync(path.join(directory, "node_modules"));
   const gitignorePath = path.join(directory, ".gitignore");
   const gitignoreCreated = projectInstall && !existsSync(gitignorePath) &&
     (!existsSync(directory) || !snapshot.existed || previous?.gitignore_created);
@@ -772,6 +774,7 @@ function installOpenCodeDependency(directory, plugin, env, home, state, previous
   const record = {
     package_json_path: packageJsonPath,
     package_json_created: !snapshot.existed,
+    node_modules_created: nodeModulesCreated,
     gitignore_created: gitignoreCreated,
     plugin_name: plugin.name,
     plugin_spec: plugin.spec,
@@ -855,9 +858,19 @@ function removeOwnedOpenCodeGitignore(scope, directory) {
 
 function uninstallOpenCodeDependency(scope, directory, snapshot = readOpenCodePackageJson(directory)) {
   const { package_json_path: packageJsonPath, package_path: packagePath } = openCodePaths(directory, scope.plugin_name);
-  const foreignDependencies = plainObject(snapshot.value?.dependencies)
-    ? Object.keys(snapshot.value.dependencies).filter((name) => name !== scope.plugin_name) : [];
-  const removeGeneratedTree = scope.package_json_created && foreignDependencies.length === 0;
+  const dependencySections = [
+    "dependencies", "devDependencies", "optionalDependencies", "peerDependencies",
+    "bundleDependencies", "bundledDependencies",
+  ];
+  const hasForeignDependencies = dependencySections.some((section) => {
+    const value = snapshot.value?.[section];
+    if (value == null) return false;
+    if (plainObject(value)) return Object.keys(value).some((name) => name !== scope.plugin_name);
+    if (Array.isArray(value)) return value.some((name) => name !== scope.plugin_name);
+    return true;
+  });
+  const removeGeneratedTree = scope.package_json_created && scope.node_modules_created === true &&
+    !hasForeignDependencies;
   if (snapshot.existed && plainObject(snapshot.value.dependencies) &&
       Object.hasOwn(snapshot.value.dependencies, scope.plugin_name)) {
     const managed = switchboardManagedOpenCodePackage(snapshot, scope.plugin_name, scope.plugin_spec);
@@ -872,8 +885,6 @@ function uninstallOpenCodeDependency(scope, directory, snapshot = readOpenCodePa
   }
   rmSync(packagePath, { recursive: true, force: true });
   if (removeGeneratedTree) {
-    removeFileIfPresent(path.join(directory, "package-lock.json"));
-    removeFileIfPresent(path.join(directory, "node_modules", ".package-lock.json"));
     rmSync(path.join(directory, "node_modules"), { recursive: true, force: true });
   }
   removeOwnedOpenCodeGitignore(scope, directory);
@@ -1185,6 +1196,7 @@ function installOne({ plan, repository, home, binPath, env, plugin }) {
         plugin_name: plugin.name,
         plugin_spec: plugin.spec,
         package_json_created: previous?.package_json_created ?? packageRecord.package_json_created,
+        node_modules_created: previous?.node_modules_created ?? packageRecord.node_modules_created,
         gitignore_created: Boolean(previous?.gitignore_created || packageRecord.gitignore_created),
         opencode_scope: projectOpenCode ? "project" : "user",
       } : {}),
@@ -1240,7 +1252,9 @@ function install({ args, repository, home, binPath, env }) {
   const project = path.resolve(projectOption ?? process.cwd());
   const explicitTargets = parseTargets(option(args, "--targets"));
   const discovered = discoverCodingHosts({ project, env });
-  const targets = explicitTargets ?? (global ? ["claude-code"] : HOSTS.filter((host) => discovered[host]));
+  const targets = explicitTargets ?? (global
+    ? ["claude-code", "opencode"].filter((host) => discovered[host])
+    : HOSTS.filter((host) => discovered[host]));
   if (!targets.length) throw new Error("No supported coding host was found");
   if (global && targets.includes("codex")) throw new Error("Only Claude Code and OpenCode support --global");
   const plugin = resolveOpenCodePlugin(option(args, "--opencode-plugin-tarball"));

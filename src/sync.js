@@ -186,6 +186,11 @@ function initializeSyncTables(repository, link, onAfterUpgradeLock = null) {
         ON hosted_sync_uploads(link_key, upload_seq)
         WHERE state = 'rejected_recorded' AND reemitted_event_id IS NULL
       `);
+      repository.db.exec(`
+        CREATE INDEX IF NOT EXISTS hosted_sync_uploads_pending
+        ON hosted_sync_uploads(link_key, upload_seq)
+        WHERE state = 'pending'
+      `);
       repository.db.prepare(`
         INSERT OR IGNORE INTO hosted_sync_state(
           link_key, download_cursor, bootstrap_complete, upload_scan_rowid, next_upload_seq, updated_at
@@ -1181,9 +1186,11 @@ async function pushAll({ repository, link, key, fetchImpl, summary, onAfterUploa
       continue;
     }
     if (result.response.status === 403 && result.body.error === "sync_device_not_approved") throw new SyncTransportError("not_approved");
-    if (result.response.status !== 200 || !exactKeys(result.body, new Set(["outcomes", "upload_seq"])) ||
-      !Array.isArray(result.body.outcomes)) {
+    if (result.response.status !== 200) {
       throw new SyncTransportError(result.response.status >= 500 ? "hosted_unavailable" : "sync_refused");
+    }
+    if (!exactKeys(result.body, new Set(["outcomes", "upload_seq"])) || !Array.isArray(result.body.outcomes)) {
+      throw new SyncTransportError("invalid_response");
     }
     const uploadSeq = result.body.upload_seq;
     const outcomes = result.body.outcomes;
@@ -1249,7 +1256,7 @@ export function syncFailureMessage(result) {
   if (result?.status === "cursor_desync") {
     const local = result.failure_detail?.local_cursor ?? "unknown";
     const server = result.failure_detail?.server_cursor ?? "unknown";
-    return `Hosted sync cursors have diverged (local ${local}, server ${server}). Run switchboard sync --replay-from ${local} or contact support.`;
+    return `Hosted sync cursors have diverged (local ${local}, server ${server}). Hosted sync stays paused. Unlink and relink this device to re-bootstrap from the hosted snapshot, or contact support.`;
   }
   return "Hosted sync is unavailable.";
 }
