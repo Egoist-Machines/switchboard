@@ -4,7 +4,7 @@
     "type": "git",
     "url": "git+https://github.com/Egoist-Machines/switchboard.git"
   },
-  "version": "0.2.1",
+  "version": "0.2.2",
   "type": "module",
   "description": "Switchboard: local-first, model-neutral memory for coding agents. Part of AI Passport.",
   "license": "Apache-2.0",
