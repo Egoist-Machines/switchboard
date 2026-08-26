@@ -55,7 +55,7 @@ switchboard init # Create the local store
 
 ### 3. Connect your editors
 
-The coding installer configures every supported host it finds. It pairs one exact client per host, creates its frozen `coding` grant for `preference`, `fact`, `project`, and `instruction`, stores private credentials, and verifies the adapter against the local store.
+The coding installer attempts every supported host it finds. A failure for one host does not prevent the other detected editors from installing. Each successful install pairs one exact client, creates its frozen `coding` grant for `preference`, `fact`, `project`, and `instruction`, stores private credentials, and verifies the adapter against the local store.
 
 ```bash
 switchboard coding install # Install detected editor adapters

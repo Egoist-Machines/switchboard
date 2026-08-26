@@ -41,6 +41,14 @@ switchboard --help
 switchboard <command> --help
 ```
 
+**`switchboard --version`**, **`switchboard -v`**, and **`switchboard version`** print the version and exit with code 0 without opening the store.
+
+```text
+switchboard --version
+switchboard -v
+switchboard version
+```
+
 ### Initialize the store
 
 **`switchboard init`** creates or opens the store and writes **`runtime.json`**. Repeated calls keep existing state and print this line:
@@ -180,15 +188,26 @@ switchboard init
 switchboard coding install [--targets opencode,claude-code,codex] [--project <directory>] [--global]
 ```
 
-The installer pairs one exact client for each host and creates a `coding` grant. It reuses an active client and grant on repeated runs, then prints the client ID, granted categories, verification result, and uninstall command.
+The installer pairs one exact client for each host and creates a `coding` grant. It reuses an active client and grant on repeated runs, then prints the client ID, granted categories, verification result, and uninstall command. It attempts every requested host. If one host fails, it prints these lines to standard error, continues with the other requested hosts, and exits with code 1 after the remaining installs finish:
 
-Claude Code uses **`~/.claude/settings.json`** by default. Use `--project <directory>` for the project's **`.claude/settings.json`**, or `--global` to request user scope explicitly. Codex uses the project's **`.codex/hooks.json`**; Codex 0.148 provides this hook file at project scope, so Switchboard does not install a global Codex hook.
+```text
+<host>: install failed: <reason>
+remediation: switchboard coding install --targets <host> [--project .]
+```
 
-OpenCode installs `opencode-ai-passport` in the project and writes **`.opencode/plugin/ai-passport.js`**. That entry enables ambient memory and hand-offs, treats the install as the owner-present ceremony, and keeps hosted fallback off. Before the package is published, use a local package archive:
+Claude Code uses **`~/.claude/settings.json`** by default. Use `--project <directory>` for the project's **`.claude/settings.json`**, or `--global` to request user scope explicitly. Codex uses the project's **`.codex/hooks.json`**; Codex 0.148 provides this hook file at project scope, so Switchboard does not install a global Codex hook. Codex runs a hook only when **`~/.codex/config.toml`** contains a matching `trusted_hash` in its `[hooks.state]` entry. Hooks without a matching hash are skipped silently. The installer records the hash for its installed hook, backs up `config.toml` before changing it, and prints `hook trust: recorded` or `hook trust: already recorded`. Uninstall removes the trust entry. If the entry cannot be recorded, the install still succeeds and prints this guidance to standard error:
+
+```text
+codex: hook trust could not be recorded: <reason>. Open codex in this project and trust the hook via /hooks.
+```
+
+OpenCode installs **`@egoistmachines/opencode-switchboard`** in the project and writes **`.opencode/plugin/ai-passport.js`**. That entry enables ambient memory and hand-offs, treats the install as the owner-present ceremony, and keeps hosted fallback off. The installer records the plugin as a regular dependency in **`.opencode/package.json`**, creates that manifest when needed, and merges into an existing manifest after creating a timestamped backup. It runs `npm install` inside **`.opencode/`**, which installs the package at **`.opencode/node_modules/@egoistmachines/opencode-switchboard`**. Later npm activity at the project root does not touch that directory. When the directory is missing, OpenCode reinstalls the plugin from the manifest at startup. For development, use a local package archive:
 
 ```text
 switchboard coding install --targets opencode --project <directory> --opencode-plugin-tarball <archive>
 ```
+
+The tarball form reads the plugin name from the archive and records a `file:` dependency with the archive's absolute path in the manifest. Uninstall removes that dependency entry and installed package. It deletes the manifest only when the installer created it and no other manifest content remains.
 
 For Claude Code and Codex, Switchboard appends only its own hook to existing JSON config and keeps unrelated settings and hooks. OpenCode uses its exact managed entry file and refuses to replace a foreign entry. Each host has one paired client shared across that host's installed project or user scopes; versioned per-host state records every scope, installed entry, and config file identity.
 
@@ -198,7 +217,14 @@ Changing an existing Claude Code or Codex config creates a timestamped backup be
 - Codex: **`~/.local/share/switchboard/codex-credentials.json`**
 - OpenCode: **`switchboard-credentials.json`** in the OpenCode state directory
 
-Use **`switchboard coding status`** to print install state, client ID, active coding categories, config state, and the last verification result for each host. Use **`switchboard coding doctor`** to repeat discovery and adapter verification and check credential permissions and store health. Failed store and adapter checks print an exact initialization or install command, while invalid install state prints fail-closed repair guidance.
+Use **`switchboard coding status`** to print install state, client ID, active coding categories, config state, and the last verification result for each host. When a host has scopes installed for other projects but not the selected project, status prints `installed=no (N other scopes)`. The Codex line also prints `hook_trust=ok`, `hook_trust=missing`, `hook_trust=stale`, or `hook_trust=unknown` for the selected installed scope. Use **`switchboard coding doctor`** to repeat discovery and adapter verification and check credential permissions, store health, and Codex hook trust. Doctor exits with code 1 when Codex trust is missing or stale and prints these remediation lines:
+
+```text
+remediation: switchboard coding install --targets codex --project .
+or open codex in this project and trust the hook via /hooks.
+```
+
+Failed store and adapter checks print an exact initialization or install command, while invalid install state prints fail-closed repair guidance.
 
 ```text
 switchboard coding status [--project <directory>]
@@ -560,3 +586,19 @@ Use a positive integer followed by `m`, `h`, or `d`.
 ### `memory was refused`
 
 Remove payment-card numbers, private keys, service secrets, or binary content. Keep memory content at or below 32 KiB.
+
+### `OpenCode plugin tarball is unreadable`
+
+Pass a readable gzip package archive with a `package/package.json` file that contains a non-empty package name.
+
+### `.opencode/package.json exists and is not valid JSON`
+
+Repair or replace the manifest with one JSON object, then run the install command again. Switchboard does not install an OpenCode plugin when it cannot read the manifest.
+
+### `OpenCode plugin installation failed: <npm reason>`
+
+The installer includes the final npm error lines after this prefix. Check the npm reason, then rerun **`switchboard coding install --targets opencode --project <directory>`**. The failure does not stop the installer from attempting other requested hosts.
+
+### Codex hook trust
+
+When `coding status` shows `hook_trust=missing` or `hook_trust=stale`, run **`switchboard coding doctor --project <directory>`**. It exits with code 1 and prints the install command plus `or open codex in this project and trust the hook via /hooks.` Open Codex in that project and use `/hooks` to trust the hook when Switchboard cannot record the trust entry itself.

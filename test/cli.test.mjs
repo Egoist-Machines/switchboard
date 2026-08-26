@@ -82,7 +82,7 @@ test("init is idempotent and creates private store and discovery files", (t) => 
   assert.match(first.stdout, /kept automatically/);
   assert.match(first.stdout, /Nothing leaves this machine/);
   assert.deepEqual(secondMetadata, firstMetadata);
-  assert.deepEqual({ ...firstRecord, bin: undefined }, { version: "0.1.0", home, transport: "cli", bin: undefined });
+  assert.deepEqual({ ...firstRecord, bin: undefined }, { version: packageJson.version, home, transport: "cli", bin: undefined });
   assert.equal(path.isAbsolute(firstRecord.bin), true);
   assert.equal(existsSync(firstRecord.bin), true);
   assert.equal(statSync(home).mode & 0o777, 0o700);
