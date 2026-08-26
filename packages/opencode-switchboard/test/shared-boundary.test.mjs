@@ -37,10 +37,10 @@ test("shared agent modules import only built-ins and other shared modules", () =
   }
 });
 
-test("the OpenCode runtime and shared core contain no other host's literal", () => {
+test("the OpenCode runtime and shared core contain no unrelated host branding", () => {
   const runtimeDir = path.resolve(sharedDir, "..");
   for (const file of findModules(runtimeDir)) {
     const source = readFileSync(file, "utf8");
-    assert.doesNotMatch(source, /openclaw|ego\.ist\/openclaw/i, `${path.basename(file)} names another host`);
+    assert.doesNotMatch(source, /\b(?:claude|cursor|copilot)\b/i, `${path.basename(file)} names another host`);
   }
 });

@@ -1,17 +1,14 @@
 import { PassportAuthError } from "./credentials.js";
 
-// The host-neutral authenticated-request engine both plane surfaces share (the
-// /agent/prefetch client in src/client.js and the tool-policy reporter in
-// src/policy.js). Everything transport-shaped lives here ONCE: bearer
+// The host-neutral authenticated-request engine both plane surfaces share.
+// It centralizes bearer
 // headers, redirect refusal, per-class backoff, the forbidden
 // probe-then-latch, the client-side request budget, the single 401
 // refresh-retry, and terminal credential verdicts with their recheck window.
-// The first version of the reporter re-implemented all of it, which meant the
-// next transport fix had to land twice or the surfaces silently diverged.
 //
 // Each surface keeps its OWN transport instance on purpose. The backend
 // throttles per route (prefetch 60/min, policy check 600/min, ...), so budget
-// state must not be pooled: a chatty policy reporter must never spend the
+// state must not be pooled: a chatty policy monitor must never spend the
 // prefetch budget, and a prefetch 429 must not black out the audit trail.
 // The cost is that a plane-closed 403 is probed once per surface per window,
 // which is two requests where one would do; that is cheaper than the shared
@@ -21,15 +18,9 @@ const BACKOFF_MS = {
   // 429 is the backend telling us our own cadence is wrong; pause for at
   // least one cache window so the next call is served from cache anyway.
   rate_limited: 60_000,
-  // 403/404 mean the plane is closed to this install: the agent backend is
-  // disabled on that deployment (it ships behind a flag and Express answers
-  // its default 404 while it is dark), or this client is not an agent-connect
-  // registration. Nothing the plugin does will change that soon, so a REPEAT
-  // latches this long window. A single 403 can also be one transient store
-  // blip during the backend's token verification (it deliberately leaves a
-  // failed client lookup uncached so a blip costs one read, not a lockout),
-  // so the first one only pauses for `forbidden_probe` and the next read
-  // re-probes instead of amplifying the blip into a five-minute blackout.
+  // 403/404 mean this plane is unavailable to the install. Probe once after a
+  // short interval before using the longer backoff, because one response can
+  // still be transient.
   forbidden: 5 * 60 * 1000,
   forbidden_probe: 60_000,
   // 400 means we sent a shape the backend refuses: a version skew, not a

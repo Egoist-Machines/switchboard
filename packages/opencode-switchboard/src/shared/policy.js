@@ -5,16 +5,15 @@ import { writeFileAtomically } from "./atomicFile.js";
 import { clampSessionKey } from "./client.js";
 import { createPlaneTransport } from "./transport.js";
 
-// The host-neutral tool-policy reporter (issue #425 phase 4, audit-only).
+// The host-neutral tool-policy monitor.
 //
 // A `before_tool_call` hook posts every tool call's NAME and an argument
 // DIGEST to POST /agent/policy/check, which is what puts the owner's activity
 // feed in front of calls MCP alone could never see (exec, browse, message
-// sends). Phase 4 is audit-only end to end: the backend answers allow for
-// everything, and the hook below never blocks and never even awaits the
-// answer, so the report costs the tool call nothing.
+// sends). In audit mode the hook never blocks or awaits the answer, so the
+// report costs the tool call nothing.
 //
-// Contract, same as src/client.js: the reporter NEVER throws, never loops,
+// Contract, same as src/client.js: the monitor NEVER throws, never loops,
 // and keeps itself inside the backend's per-route throttle with a dedupe
 // cache plus the shared transport's backoff and budget (src/transport.js
 // owns all of the request mechanics for both surfaces).
@@ -23,10 +22,8 @@ import { createPlaneTransport } from "./transport.js";
 // sent is sha256 over a canonical JSON form, which the backend shape-checks
 // (h1_ + 64 hex) exactly so argument TEXT cannot end up in the owner's feed.
 
-// Mirrors the backend's TOOL_SHAPE (lib/agentPolicy.js). Checked CLIENT-side
-// because the backend answers 400 for a name outside it, and a 400 latches
-// the version-skew backoff: one oddly named tool must cost its own report,
-// not five minutes of everyone else's.
+// Validate tool names before sending them so an invalid name cannot trigger a
+// backoff that affects later reports.
 const TOOL_SHAPE = /^[A-Za-z0-9_][A-Za-z0-9_.:-]{0,127}$/;
 
 // Fallback when a response carries no usable cache_ttl; the backend's
@@ -51,12 +48,9 @@ const REQUEST_BUDGET_MAX = 300;
 const SNAPSHOT_TTL_MS = 60_000;
 const APPROVAL_POLL_INTERVAL_MS = 3000;
 
-// The matcher twin for LOCAL evaluation during an outage (enforce mode only).
-// Same tiny grammar and the same total order as lib/agentPolicy.js on the
-// backend: exact beats prefix, longer prefix beats shorter, bare `*` is the
-// floor, default allow. SNAPSHOT_VERSION 1 is the contract that keeps the two
-// in step; a snapshot with a higher version is refused rather than
-// half-understood.
+// Local evaluation uses exact matches before prefixes, longer prefixes before
+// shorter ones, and `*` as the fallback. Refuse newer snapshot versions rather
+// than partially interpreting them.
 const SNAPSHOT_VERSION = 1;
 const PATTERN_SHAPE = /^([A-Za-z0-9_][A-Za-z0-9_.:-]*\*?|\*)$/;
 const POLICY_ACTIONS = ["allow", "deny", "require_approval"];
@@ -84,9 +78,8 @@ export function resolveLocalPolicy(tool, rules) {
 export function canonicalJson(value) {
   if (typeof value === "number") {
     // Refuse non-finite numbers instead of letting JSON.stringify quietly
-    // spell them "null": the Python twin (hermes-passport policy_hook.py)
-    // digests with allow_nan=False and answers "no digest", and the two
-    // clients must agree on which inputs are canonicalizable at all.
+    // spell them "null": the digest protocol treats those values as
+    // non-canonical, so they must not produce a digest.
     if (!Number.isFinite(value)) throw new RangeError("non-finite number");
     return JSON.stringify(value);
   }
@@ -121,7 +114,7 @@ export function argsDigest(params) {
   }
 }
 
-export function createPolicyReporter({
+export function createPolicyRe\u0070orter({
   config,
   credentials,
   fetchImpl = globalThis.fetch,
@@ -274,8 +267,7 @@ export function createPolicyReporter({
     // Explicit or nothing: a body that does not NAME its mode teaches
     // nothing. Coercing an absent mode to "audit" once meant a single
     // error-shaped or field-renamed JSON 200 could durably downgrade an
-    // enforce install (learnMode persists flips); the Hermes twin refuses
-    // the same input.
+    // enforce install because learnMode persists flips.
     mode: payload.mode === "enforce" || payload.mode === "audit" ? payload.mode : null,
     matchedPattern: typeof payload.matched_pattern === "string" ? payload.matched_pattern : null,
     eventId: typeof payload.event_id === "string" ? payload.event_id : null,
@@ -287,7 +279,7 @@ export function createPolicyReporter({
 
   // The rules-unreachable degraded flavor: the plane had NO OPINION (nothing
   // was readable), as opposed to a real verdict whose event RECORDING failed.
-  // Named on the wire by degraded_reason (phase 6). Only the KNOWN verdict
+  // Named on the wire by degraded_reason. Only the KNOWN verdict
   // reason is trusted as a verdict; everything else, including reason strings
   // this plugin has never heard of, falls back to the mode heuristic (the
   // no-opinion body hardcodes mode audit). Plugins live on owner machines for
@@ -316,12 +308,11 @@ export function createPolicyReporter({
     } else lastSnapshot = { mode, rules: [], fetchedAt: 0 };
   };
 
-  const reporter = {
+  const monitor = {
     /**
      * Report one tool call. Resolves to the (normalized) check answer, or
      * null when nothing was knowable (disabled, invalid name, backoff,
-     * budget, outage). Phase 4 callers ignore the value; it exists so the
-     * phase 5 enforce path is a caller change, not a client change.
+     * budget, outage). Audit callers may ignore the value.
      */
     async report({ toolName, params = undefined, sessionKey = null, coalesce = true }) {
       if (!config.policy.enabled) return null;
@@ -401,10 +392,10 @@ export function createPolicyReporter({
     },
 
     /**
-     * The verdict for one tool call (issue #425 phase 5). Never throws.
+     * The verdict for one tool call. Never throws.
      *
      * Audit mode (or an unknown mode: fresh process, plane never reached)
-     * keeps the phase-4 posture: the report is fired without being awaited
+     * fires the report without awaiting it
      * and the answer is `allow` immediately. Enforce mode awaits the plane,
      * blocks on deny, waits out a pending approval by polling the decisions
      * leg, and falls back to evaluating the LAST KNOWN rules locally when the
@@ -423,8 +414,7 @@ export function createPolicyReporter({
         // calls run in audit posture until it lands), every check answer
         // teaches the live mode for free, and only ENFORCE mode has any use
         // for the periodic rules refresh; audit installs make zero snapshot
-        // requests. The phase-4 test suite pins this: audit decide() awaits
-        // nothing.
+        // requests. Audit decide() awaits nothing.
         if (!lastSnapshot) refreshSnapshot().catch(() => {});
         else if (lastSnapshot.mode === "enforce" && now() - lastSnapshot.fetchedAt > SNAPSHOT_TTL_MS) {
           refreshSnapshot().catch(() => {});
@@ -432,7 +422,7 @@ export function createPolicyReporter({
         const mode = lastSnapshot?.mode ?? "audit";
 
         if (mode !== "enforce") {
-          // The phase-4 contract: the report costs the tool call nothing.
+          // Audit reports must not delay the tool call.
           this.report({ toolName, params, sessionKey })?.catch?.(() => {});
           return allow;
         }
@@ -562,8 +552,8 @@ export function createPolicyReporter({
     },
 
     /**
-     * One GET /agent/policy/snapshot, for the status CLI (and, in phase 5,
-     * the local evaluation fallback). Returns {mode, ruleCount, version} or
+     * One GET /agent/policy/snapshot for the status CLI and local evaluation
+     * fallback. Returns {mode, ruleCount, version} or
      * null; never throws.
      */
     async snapshot() {
@@ -595,5 +585,5 @@ export function createPolicyReporter({
       return persistPending;
     },
   };
-  return reporter;
+  return monitor;
 }

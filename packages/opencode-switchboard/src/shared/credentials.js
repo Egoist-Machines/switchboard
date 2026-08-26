@@ -181,16 +181,9 @@ export function createCredentials({
   };
 
   const requestToken = async (current) => {
-    // No `resource` parameter. Verified against lib/oauth.js
-    // exchangeRefreshToken (2026-08-15): the audience a rotation binds is the
-    // one already stored on the chain, and connect-code redeem always stores
-    // it (lib/agentConnect.js), so sending it cannot change the outcome of our
-    // refreshes. It can only fail them: a value that is not byte-equal to the
-    // server's canonical issuer + /mcp answers invalid_grant, which this
-    // plugin latches as terminal and which sends the owner off to re-pair a
-    // healthy install. Deriving it from tokenUrl (the only value we hold)
-    // diverges from the canonical one for any deployment whose public URL
-    // carries a path or whose issuer and public URL are configured apart.
+    // Omit `resource`: the credential's audience is fixed, and this plugin
+    // cannot reconstruct it from tokenUrl safely. A mismatched value turns a
+    // valid refresh into invalid_grant and requires the owner to re-pair.
     const body = new URLSearchParams({
       grant_type: "refresh_token",
       client_id: current.clientId,
@@ -236,14 +229,9 @@ export function createCredentials({
       );
     }
     if (payload?.error === "invalid_client") {
-      // The registration this install was paired under no longer exists: the
-      // owner severed it, or the deployment's client store was reset. Verified
-      // against the backend (2026-08-14): its store THROWS on a failed read,
-      // which the OAuth layer answers as a 500, so invalid_client is never a
-      // transient blip and retrying it hourly only hides a dead install behind
-      // "answered 400". The terminal latch still re-probes on its recheck
-      // window, so a wrong verdict costs minutes of stale context, not the
-      // install. The same rule applies to every host adapter.
+      // invalid_client means this pairing is no longer usable, so retrying
+      // cannot restore it. The terminal latch still rechecks later, limiting
+      // an incorrect verdict to stale context rather than a broken install.
       throw new PassportAuthError(
         `AI Passport refresh token is spent or revoked. ${recoveryCopy.credentialRecoveryInstruction}`,
         { terminal: true, code: "invalid_client" }

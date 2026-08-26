@@ -1,7 +1,7 @@
 import { createTtlCache } from "./cache.js";
 import { createPlaneTransport } from "./transport.js";
 
-// The host-neutral /agent/prefetch client (issue #425 phase 1 plane).
+// The host-neutral /agent/prefetch client.
 //
 // Contract this side of the wire commits to:
 //   - it NEVER throws. Both callers sit on paths where a rejection is worse
@@ -16,13 +16,12 @@ import { createPlaneTransport } from "./transport.js";
 //
 // The request mechanics (bearer, redirect refusal, per-class backoff, the
 // forbidden probe-then-latch, budget, 401 retry, terminal verdicts) live in
-// src/transport.js, shared with the tool-policy reporter; what stays here is
+// src/transport.js, shared with the tool-policy monitor; what stays here is
 // what is prefetch-SHAPED: the TTL cache with stale-on-error, row retention
 // for memory_get, single-flight per cache key, and response normalization.
 
-// The backend's own request bounds (lib/agentBackendRoutes.js). Clamping here
-// rather than in each caller means a long user prompt or an unusual session
-// key can never turn into a 400 that backs the whole plugin off.
+// Clamp request fields here so a long prompt or unusual session key cannot
+// produce a 400 that backs the whole plugin off.
 const QUERY_MAX_LENGTH = 256;
 const SESSION_KEY_MAX_LENGTH = 128;
 const LIMIT_MAX = 50;
@@ -65,7 +64,7 @@ const clampLimit = (value, fallback) => {
 // text makes most context reads cache misses, so an uncapped process can trip
 // the backend throttle and black out EVERY surface for a minute. Spending at
 // most half the budget leaves headroom for the install's other processes
-// (gateway, cron, CLI) before the backend has to say 429.
+// before the backend has to say 429.
 const REQUEST_BUDGET_MAX = 30;
 
 export function createPassportClient({ config, credentials, fetchImpl = globalThis.fetch, logger = null, now = () => Date.now() }) {
@@ -84,11 +83,8 @@ export function createPassportClient({ config, credentials, fetchImpl = globalTh
   // supplement's get(). Bounded, and content the owner already approved.
   const rowsById = new Map();
   const MAX_RETAINED_ROWS = 200;
-  // In-flight requests by cache key (the same reason lib/trustLoop.js
-  // memoizes its namespace reads): the TTL cache stores only COMPLETED
-  // answers, so at cold start or on TTL expiry N concurrent turns of one
-  // gateway would otherwise each spend the request budget, and the backend's
-  // 60/min ceiling, on N copies of one identical read.
+  // In-flight requests by cache key prevent concurrent callers from spending
+  // the request budget on identical reads before the TTL cache is populated.
   const pendingByKey = new Map();
 
   const rememberRows = (rows) => {

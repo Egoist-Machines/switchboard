@@ -648,7 +648,8 @@ test("Codex install succeeds when user hook trust cannot be written", (t) => {
   assert.match(install.stderr, /codex: hook trust could not be recorded: .* Open codex in this project and trust the hook via \/hooks\./);
 });
 
-test("OpenCode install uses the packed plugin local transport and writes owner-present options", { skip: !hasOpencodeSibling }, (t) => {
+// This test fetches from the npm registry and is skipped by SWITCHBOARD_OFFLINE=1.
+test("OpenCode install uses the packed plugin local transport and writes owner-present options", { skip: !hasOpencodeSibling || process.env.SWITCHBOARD_OFFLINE === "1" }, (t) => {
   const setup = fixture(t);
   hostStub(setup.bin, "opencode");
   assert.equal(setup.run(["init"]).status, 0);
