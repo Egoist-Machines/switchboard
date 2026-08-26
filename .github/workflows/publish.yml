@@ -18,6 +18,19 @@ jobs:
           node-version: 22
           registry-url: https://registry.npmjs.org
       - run: npm ci
+      - run: npm ci
+        working-directory: packages/opencode-switchboard
       - run: npm test
+      - run: npm test
+        working-directory: packages/opencode-switchboard
       - run: npm install -g npm@11
       - run: npm publish --provenance --access public
+      - name: Publish the OpenCode plugin when its version is new
+        working-directory: packages/opencode-switchboard
+        run: |
+          version=$(node -p "require('./package.json').version")
+          if npm view "@egoistmachines/opencode-switchboard@${version}" version >/dev/null 2>&1; then
+            echo "plugin ${version} is already published"
+          else
+            npm publish --provenance --access public
+          fi

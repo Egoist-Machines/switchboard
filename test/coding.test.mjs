@@ -16,12 +16,10 @@ import { LocalRepository } from "../src/repository.js";
 import { resolveProjectScope } from "../src/projectIdentity.js";
 
 const cli = new URL("../src/cli.js", import.meta.url);
-const opencodePackage = new URL("../../opencode-passport", import.meta.url);
-// The OpenCode plugin lives in the Egoist Machines monorepo beside this
-// package; its integration seam only runs there.
+const opencodePackage = new URL("../packages/opencode-switchboard", import.meta.url);
 const hasOpencodeSibling = existsSync(opencodePackage);
 const formatMemoryBlock = hasOpencodeSibling
-  ? (await import("../../opencode-passport/src/context.js")).formatMemoryBlock
+  ? (await import("../packages/opencode-switchboard/src/context.js")).formatMemoryBlock
   : null;
 
 function fixture(t) {
