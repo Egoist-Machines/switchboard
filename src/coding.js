@@ -45,10 +45,13 @@ function ownerHome(env = process.env) {
   return typeof env.HOME === "string" && env.HOME.trim() ? path.resolve(env.HOME) : os.homedir();
 }
 
+function codexHome(env = process.env) {
+  return typeof env.CODEX_HOME === "string" && env.CODEX_HOME.trim()
+    ? path.resolve(env.CODEX_HOME) : path.join(ownerHome(env), ".codex");
+}
+
 function codexUserConfigPath(env = process.env) {
-  const codexHome = typeof env.CODEX_HOME === "string" && env.CODEX_HOME.trim()
-    ? env.CODEX_HOME : path.join(ownerHome(env), ".codex");
-  return path.join(codexHome, "config.toml");
+  return path.join(codexHome(env), "config.toml");
 }
 
 function statePath(home, host) {
@@ -308,7 +311,7 @@ function hostPaths(host, { project, projectClaude = false, env = process.env } =
     credential: hostCredentialPath(host, { env, home }),
   };
   if (host === "codex") return {
-    config: path.join(project, ".codex", "hooks.json"), credential: hostCredentialPath(host, { env, home }),
+    config: path.join(codexHome(env), "hooks.json"), credential: hostCredentialPath(host, { env, home }),
   };
   return {
     config: path.join(project, ".opencode", "plugin", "ai-passport.js"),
@@ -320,7 +323,7 @@ export function discoverCodingHosts({ project = process.cwd(), env = process.env
   const home = ownerHome(env);
   return {
     "claude-code": executableOnPath("claude", env) || existsSync(path.join(home, ".claude")),
-    codex: executableOnPath("codex", env) || existsSync(path.join(home, ".codex")) || existsSync(path.join(project, ".codex")),
+    codex: executableOnPath("codex", env) || existsSync(codexHome(env)),
     opencode: executableOnPath("opencode", env) || existsSync(hostCredentialPath("opencode", { env, home })) || existsSync(path.join(project, ".opencode")),
   };
 }
@@ -338,11 +341,23 @@ function parseTargets(value) {
 }
 
 function scopeId(repository, host, { project, projectClaude }) {
-  const scope = host === "claude-code" && !projectClaude ? "user" : `project:${project}`;
+  const scope = (host === "claude-code" && !projectClaude) || host === "codex" ? "user" : `project:${project}`;
   return repository.scopeFingerprint(`coding-install:${host}:${scope}`);
 }
 
 const currentScope = (state, scope) => state.scopes.find((entry) => entry.scope_id === scope) ?? null;
+
+function legacyCodexProjectScopeId(repository, project) {
+  return repository.scopeFingerprint(`coding-install:codex:project:${project}`);
+}
+
+function selectedScope(state, repository, host, { project, projectClaude }) {
+  if (host === "codex") {
+    const legacy = currentScope(state, legacyCodexProjectScopeId(repository, project));
+    if (legacy) return legacy;
+  }
+  return currentScope(state, scopeId(repository, host, { project, projectClaude }));
+}
 
 function activeClient(repository, host, credentialPath, expectedClientId = null) {
   try {
@@ -1118,9 +1133,9 @@ function status({ args, repository, home, env }) {
       process.stdout.write(`${host}: installed=unknown client=unknown grants=unknown config=unknown verification=state_invalid\n`);
       continue;
     }
-    const scope = currentScope(state, scopeId(repository, host, {
+    const scope = selectedScope(state, repository, host, {
       project, projectClaude: host === "claude-code" && Boolean(projectOption),
-    }));
+    });
     const client = state.client_id
       ? repository.listClients().find((entry) => entry.client_id === state.client_id && !entry.revoked_at) : null;
     const grants = client ? grantSummary(repository, client.client_id) : [];
@@ -1175,9 +1190,9 @@ function doctor({ args, repository, home, env }) {
       } else process.stdout.write(`remediation: ${STATE_REMEDIATION}\n`);
       continue;
     }
-    const scope = currentScope(state, scopeId(repository, host, {
+    const scope = selectedScope(state, repository, host, {
       project, projectClaude: host === "claude-code" && Boolean(projectOption),
-    }));
+    });
     let verification = "not_installed";
     let trust = null;
     if (scope) {
@@ -1207,7 +1222,6 @@ function uninstall({ args, repository, home, env }) {
   const projectOption = option(args, "--project");
   const project = path.resolve(projectOption ?? process.cwd());
   const projectClaude = host === "claude-code" && Boolean(projectOption) && !args.includes("--global");
-  const scopeIdValue = scopeId(repository, host, { project, projectClaude });
   const state = readState(home, host, { required: true });
   if (state.transaction) {
     const recovered = state.transaction.commit
@@ -1215,7 +1229,7 @@ function uninstall({ args, repository, home, env }) {
       : rollbackTransaction(repository, home, state, env);
     if (!recovered) throw recoveryError(state);
   }
-  const scope = currentScope(state, scopeIdValue);
+  const scope = selectedScope(state, repository, host, { project, projectClaude });
   if (!scope) throw new Error(STATE_REMEDIATION);
 
   // Resolve and validate everything before making the first change. State and config must agree exactly.
@@ -1236,7 +1250,7 @@ function uninstall({ args, repository, home, env }) {
     casJsonMutation(snapshot, (config) => mergeHookRemoval(config, scope), { env });
     if (host === "codex") clearCodexHookTrust(scope, env);
   }
-  state.scopes = state.scopes.filter((entry) => entry.scope_id !== scopeIdValue);
+  state.scopes = state.scopes.filter((entry) => entry.scope_id !== scope.scope_id);
   const last = state.scopes.length === 0;
   const keepClient = args.includes("--keep-client");
   if (last && !keepClient) {

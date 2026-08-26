@@ -54,6 +54,14 @@ function stateFor(setup, host) {
   return JSON.parse(readFileSync(path.join(setup.switchboardHome, "coding-installations", `${host}.json`), "utf8"));
 }
 
+function codexHooksPath(setup) {
+  return path.join(setup.ownerHome, ".codex", "hooks.json");
+}
+
+function codexTrustPath(setup) {
+  return path.join(setup.ownerHome, ".codex", "config.toml");
+}
+
 function activeInstallerRecords(setup, host) {
   const repository = new LocalRepository({ home: setup.switchboardHome });
   const clients = repository.listClients().filter((client) => client.host === host && !client.revoked_at);
@@ -129,7 +137,7 @@ test("coding install refuses an uninitialized store without creating one", (t) =
 test("discovery uses PATH stubs and host config directories without external contact", (t) => {
   const setup = fixture(t);
   hostStub(setup.bin, "claude");
-  mkdirSync(path.join(setup.project, ".codex"));
+  mkdirSync(path.join(setup.ownerHome, ".codex"));
   assert.deepEqual(discoverCodingHosts({ project: setup.project, env: { ...setup.env, PATH: setup.bin } }), {
     "claude-code": true,
     codex: true,
@@ -192,7 +200,7 @@ test("Claude and Codex hooks merge, back up, verify, rerun idempotently, and uni
   hostStub(setup.bin, "claude");
   hostStub(setup.bin, "codex");
   const claudeConfig = path.join(setup.ownerHome, ".claude", "settings.json");
-  const codexConfig = path.join(setup.project, ".codex", "hooks.json");
+  const codexConfig = codexHooksPath(setup);
   mkdirSync(path.dirname(claudeConfig), { recursive: true });
   mkdirSync(path.dirname(codexConfig), { recursive: true });
   const originalClaude = {
@@ -410,7 +418,7 @@ test("coding install continues after one host fails", (t) => {
 
 test("empty hook configs are not backed up", (t) => {
   const setup = fixture(t);
-  const config = path.join(setup.project, ".codex", "hooks.json");
+  const config = codexHooksPath(setup);
   hostStub(setup.bin, "codex");
   mkdirSync(path.dirname(config), { recursive: true });
   writeFileSync(config, "{}\n");
@@ -425,7 +433,7 @@ test("empty hook configs are not backed up", (t) => {
   assert.equal(backupsFor(config).length, backupsBeforeReinstall);
 
   const foreign = fixture(t);
-  const foreignConfig = path.join(foreign.project, ".codex", "hooks.json");
+  const foreignConfig = codexHooksPath(foreign);
   hostStub(foreign.bin, "codex");
   mkdirSync(path.dirname(foreignConfig), { recursive: true });
   writeFileSync(foreignConfig, `${JSON.stringify({
@@ -436,23 +444,28 @@ test("empty hook configs are not backed up", (t) => {
   assert.equal(backupsFor(foreignConfig).length, 1);
 });
 
-test("coding status shows other installed scopes", (t) => {
+test("Codex --project does not change the user hook location", (t) => {
   const setup = fixture(t);
   hostStub(setup.bin, "codex");
   assert.equal(setup.run(["init"]).status, 0);
   assert.equal(setup.run(["coding", "install", "--targets", "codex", "--project", setup.project]).status, 0);
   const otherProject = path.join(setup.root, "other-project");
   mkdirSync(otherProject);
-  const status = setup.run(["coding", "status", "--project", otherProject]);
-  assert.equal(status.status, 0, status.stderr);
-  assert.match(status.stdout, /codex: installed=no \(1 other scope\)/);
+  assert.equal(setup.run(["coding", "install", "--targets", "codex", "--project", otherProject]).status, 0);
+  const config = codexHooksPath(setup);
+  assert.equal(existsSync(config), true);
+  assert.equal(existsSync(path.join(setup.project, ".codex", "hooks.json")), false);
+  assert.equal(existsSync(path.join(otherProject, ".codex", "hooks.json")), false);
+  const state = stateFor(setup, "codex");
+  assert.equal(state.scopes.length, 1);
+  assert.equal(JSON.parse(readFileSync(config, "utf8")).hooks.UserPromptSubmit.length, 1);
 });
 
 test("Codex install records trust at the exact hook indices and doctor repairs it", (t) => {
   const setup = fixture(t);
   hostStub(setup.bin, "codex");
-  const hooksPath = path.join(setup.project, ".codex", "hooks.json");
-  const trustPath = path.join(setup.ownerHome, ".codex", "config.toml");
+  const hooksPath = codexHooksPath(setup);
+  const trustPath = codexTrustPath(setup);
   const foreignKey = "/foreign/.codex/hooks.json:user_prompt_submit:0:0";
   mkdirSync(path.dirname(hooksPath), { recursive: true });
   mkdirSync(path.dirname(trustPath), { recursive: true });
@@ -499,10 +512,9 @@ test("Codex install succeeds when user hook trust cannot be written", (t) => {
   hostStub(setup.bin, "codex");
   const codexHome = path.join(setup.ownerHome, ".codex");
   mkdirSync(codexHome, { recursive: true });
-  chmodSync(codexHome, 0o500);
+  mkdirSync(codexTrustPath(setup));
   assert.equal(setup.run(["init"]).status, 0);
   const install = setup.run(["coding", "install", "--targets", "codex", "--project", setup.project]);
-  chmodSync(codexHome, 0o700);
   assert.equal(install.status, 0, install.stderr);
   assert.match(install.stderr, /codex: hook trust could not be recorded: .* Open codex in this project and trust the hook via \/hooks\./);
 });
@@ -603,7 +615,7 @@ test("old OpenCode scope records retain their project-level verification and uni
 test("foreign suffix-matching hooks survive install and uninstall byte-for-byte as entries", (t) => {
   const setup = fixture(t);
   hostStub(setup.bin, "codex");
-  const configPath = path.join(setup.project, ".codex", "hooks.json");
+  const configPath = codexHooksPath(setup);
   mkdirSync(path.dirname(configPath), { recursive: true });
   const foreign = {
     matcher: "foreign",
@@ -634,7 +646,7 @@ test("seam verification executes the exact configured shell command", (t) => {
   });
   assert.equal(result.status, 0, result.stderr);
   assert.equal(readFileSync(marker, "utf8"), "yes");
-  const command = JSON.parse(readFileSync(path.join(setup.project, ".codex", "hooks.json"), "utf8"))
+  const command = JSON.parse(readFileSync(codexHooksPath(setup), "utf8"))
     .hooks.UserPromptSubmit[0].hooks[0].command;
   assert.match(command, /switchboard-wrapper\.mjs/);
 });
@@ -644,7 +656,7 @@ test("a missing recorded command is repaired while a prefixed replacement is ref
   hostStub(setup.bin, "codex");
   assert.equal(setup.run(["init"]).status, 0);
   assert.equal(setup.run(["coding", "install", "--targets", "codex", "--project", setup.project]).status, 0);
-  const configPath = path.join(setup.project, ".codex", "hooks.json");
+  const configPath = codexHooksPath(setup);
   const config = JSON.parse(readFileSync(configPath, "utf8"));
   const originalCommand = config.hooks.UserPromptSubmit[0].hooks[0].command;
   config.hooks.UserPromptSubmit[0].hooks[0].command = `env FOREIGN_PREFIX=1 ${originalCommand}`;
@@ -664,7 +676,7 @@ test("a missing recorded command is repaired while a prefixed replacement is ref
 test("symlinked configs retain their topology and mutate the resolved file", (t) => {
   const setup = fixture(t);
   hostStub(setup.bin, "codex");
-  const configPath = path.join(setup.project, ".codex", "hooks.json");
+  const configPath = codexHooksPath(setup);
   const resolved = path.join(setup.root, "real-hooks.json");
   mkdirSync(path.dirname(configPath), { recursive: true });
   writeFileSync(resolved, `${JSON.stringify({ retained: true })}\n`);
@@ -682,7 +694,7 @@ test("symlinked configs retain their topology and mutate the resolved file", (t)
 test("config CAS retries once and merges a concurrent edit", (t) => {
   const setup = fixture(t);
   hostStub(setup.bin, "codex");
-  const configPath = path.join(setup.project, ".codex", "hooks.json");
+  const configPath = codexHooksPath(setup);
   mkdirSync(path.dirname(configPath), { recursive: true });
   writeFileSync(configPath, `${JSON.stringify({ before: true, hooks: {} }, null, 2)}\n`);
   assert.equal(setup.run(["init"]).status, 0);
@@ -702,7 +714,7 @@ test("install crash recovery compensates every durable phase", (t) => {
   for (const phase of ["client_minted", "grant_created", "credential_written", "package_installed", "config_mutated", "verified"]) {
     const setup = fixture(t);
     hostStub(setup.bin, "codex");
-    const configPath = path.join(setup.project, ".codex", "hooks.json");
+    const configPath = codexHooksPath(setup);
     const credentialPath = path.join(setup.ownerHome, ".local", "share", "switchboard", "codex-credentials.json");
     const originalConfig = `{\n    "retained": true\n}\n`;
     mkdirSync(path.dirname(configPath), { recursive: true });
@@ -931,7 +943,7 @@ test("managed package.json intent is durable and compensation resumes after its 
 test("changed config leaves resumable recovery for doctor with exact remediation", (t) => {
   const setup = fixture(t);
   hostStub(setup.bin, "codex");
-  const configPath = path.join(setup.project, ".codex", "hooks.json");
+  const configPath = codexHooksPath(setup);
   const originalConfig = `${JSON.stringify({ retained: true }, null, 2)}\n`;
   mkdirSync(path.dirname(configPath), { recursive: true });
   writeFileSync(configPath, originalConfig);
@@ -975,7 +987,7 @@ test("every malformed hook config shape fails before any target mutation", (t) =
   hostStub(setup.bin, "codex");
   assert.equal(setup.run(["init"]).status, 0);
   const claudePath = path.join(setup.ownerHome, ".claude", "settings.json");
-  const codexPath = path.join(setup.project, ".codex", "hooks.json");
+  const codexPath = codexHooksPath(setup);
   mkdirSync(path.dirname(codexPath), { recursive: true });
   for (const value of malformed) {
     rmSync(path.dirname(claudePath), { recursive: true, force: true });
@@ -990,87 +1002,120 @@ test("every malformed hook config shape fails before any target mutation", (t) =
   }
 });
 
-test("two project scopes share one host client until the final uninstall", (t) => {
+test("Codex user-scope reruns do not duplicate its hook, backup, or trust entry", (t) => {
   const setup = fixture(t);
   hostStub(setup.bin, "codex");
   const secondProject = path.join(setup.root, "project-two");
   mkdirSync(secondProject);
+  const hooksPath = codexHooksPath(setup);
+  const trustPath = codexTrustPath(setup);
+  mkdirSync(path.dirname(hooksPath), { recursive: true });
+  writeFileSync(hooksPath, `${JSON.stringify({
+    hooks: { UserPromptSubmit: [{ hooks: [{ type: "command", command: "foreign-hook" }] }] },
+  }, null, 2)}\n`);
   assert.equal(setup.run(["init"]).status, 0);
-  const sentinel = "SHARED_HOST_SCOPE_SENTINEL";
-  assert.equal(setup.run(["remember", sentinel, "--category", "project"]).status, 0);
   assert.equal(setup.run(["coding", "install", "--targets", "codex", "--project", setup.project]).status, 0);
-  assert.equal(setup.run(["coding", "install", "--targets", "codex", "--project", secondProject]).status, 0);
+  const firstScope = stateFor(setup, "codex").scopes[0];
+  const firstTrust = readFileSync(trustPath, "utf8");
+  assert.equal(JSON.parse(readFileSync(hooksPath, "utf8")).hooks.UserPromptSubmit.length, 2);
+  assert.equal(backupsFor(hooksPath).length, 1);
+  assert.equal(readTrustEntry(firstTrust, firstScope.codex_trust_key) !== null, true);
+
+  const rerun = setup.run(["coding", "install", "--targets", "codex", "--project", secondProject]);
+  assert.equal(rerun.status, 0, rerun.stderr);
   const state = stateFor(setup, "codex");
-  assert.equal(state.scopes.length, 2);
-  assert.equal(new Set(state.scopes.map((scope) => scope.client_id)).size, 1);
-  assert.equal(activeInstallerRecords(setup, "codex").clients.length, 1);
-  const credentials = path.join(setup.ownerHome, ".local", "share", "switchboard", "codex-credentials.json");
-
-  const firstUninstall = setup.run(["coding", "uninstall", "--target", "codex", "--project", setup.project]);
-  assert.equal(firstUninstall.status, 0, firstUninstall.stderr);
-  assert.equal(existsSync(credentials), true);
-  assert.equal(activeInstallerRecords(setup, "codex").clients.length, 1);
-  const hook = setup.run(["hook", "codex-prefetch"], { prompt: sentinel });
-  assert.equal(hook.status, 0, hook.stderr);
-  assert.match(JSON.parse(hook.stdout).hookSpecificOutput.additionalContext, new RegExp(sentinel));
-
-  const finalUninstall = setup.run(["coding", "uninstall", "--target", "codex", "--project", secondProject]);
-  assert.equal(finalUninstall.status, 0, finalUninstall.stderr);
-  assert.equal(existsSync(credentials), false);
-  assert.equal(activeInstallerRecords(setup, "codex").clients.length, 0);
-  assert.equal(activeInstallerRecords(setup, "codex").grants.length, 0);
+  assert.equal(state.scopes.length, 1);
+  assert.equal(state.scopes[0].scope_id, firstScope.scope_id);
+  assert.equal(JSON.parse(readFileSync(hooksPath, "utf8")).hooks.UserPromptSubmit.length, 2);
+  assert.equal(backupsFor(hooksPath).length, 1);
+  assert.equal(readFileSync(trustPath, "utf8"), firstTrust);
 });
 
-test("two-scope credential replacement keeps the original client and first scope working until final commit", (t) => {
+test("CODEX_HOME controls Codex hooks, trust, and doctor", (t) => {
   const setup = fixture(t);
   hostStub(setup.bin, "codex");
-  const secondProject = path.join(setup.root, "project-two");
-  mkdirSync(secondProject);
+  const codexHome = path.join(setup.root, "custom-codex-home");
+  const hooksPath = path.join(codexHome, "hooks.json");
+  const trustPath = path.join(codexHome, "config.toml");
+  mkdirSync(codexHome, { recursive: true });
+  writeFileSync(hooksPath, `${JSON.stringify({
+    hooks: { UserPromptSubmit: [{ hooks: [{ type: "command", command: "foreign-hook" }] }] },
+  }, null, 2)}\n`);
   assert.equal(setup.run(["init"]).status, 0);
-  const sentinel = "REPLACEMENT_CRASH_SENTINEL";
-  assert.equal(setup.run(["remember", sentinel, "--category", "project"]).status, 0);
-  assert.equal(setup.run(["coding", "install", "--targets", "codex", "--project", setup.project]).status, 0);
-  assert.equal(setup.run(["coding", "install", "--targets", "codex", "--project", secondProject]).status, 0);
-  const credentialsPath = path.join(setup.ownerHome, ".local", "share", "switchboard", "codex-credentials.json");
-  const oldCredentials = JSON.parse(readFileSync(credentialsPath, "utf8"));
-  chmodSync(credentialsPath, 0o644);
-
-  const crashed = setup.run(
-    ["coding", "install", "--targets", "codex", "--project", secondProject],
-    null,
-    { SWITCHBOARD_CODING_CRASH_AFTER_PHASE: "commit_prepared" },
+  const install = setup.run(
+    ["coding", "install", "--targets", "codex", "--project", setup.project], null, { CODEX_HOME: codexHome },
   );
-  assert.equal(crashed.status, 86, crashed.stderr);
-  const crashedState = stateFor(setup, "codex");
-  assert.notEqual(crashedState.client_id, oldCredentials.client_id);
-  assert.equal(crashedState.scopes.length, 2);
-  assert.equal(crashedState.scopes.every((installedScope) => installedScope.client_id === crashedState.client_id), true);
-  assert.equal(crashedState.transaction.commit.old_client_id, oldCredentials.client_id);
-  assert.equal(crashedState.transaction.commit.scope_ids.length, 2);
-  assert.equal(existsSync(path.join(setup.project, ".codex", "hooks.json")), true);
+  assert.equal(install.status, 0, install.stderr);
+  const scope = stateFor(setup, "codex").scopes[0];
+  const hooks = JSON.parse(readFileSync(hooksPath, "utf8"));
+  const indices = findSwitchboardHookIndices(hooks, scope.entry_b64);
+  const trustKey = codexHookStateKey(hooksPath, indices.groupIndex, indices.handlerIndex);
+  assert.equal(scope.config.requested_path, path.resolve(hooksPath));
+  assert.equal(scope.codex_trust_key, trustKey);
+  assert.equal(readTrustEntry(readFileSync(trustPath, "utf8"), trustKey), codexHookTrustedHash(indices.handler));
+  assert.equal(existsSync(codexHooksPath(setup)), false);
+  const doctor = setup.run(["coding", "doctor", "--project", setup.project], null, { CODEX_HOME: codexHome });
+  assert.equal(doctor.status, 0, doctor.stderr);
+  assert.match(doctor.stdout, /codex: discovered=yes verification=passed_empty hook_trust=ok/);
+});
 
+test("legacy project-scoped Codex records remain verifiable and removable with user scopes", (t) => {
+  const setup = fixture(t);
+  hostStub(setup.bin, "codex");
+  const otherProject = path.join(setup.root, "project-two");
+  mkdirSync(otherProject);
+  assert.equal(setup.run(["init"]).status, 0);
+  assert.equal(setup.run(["coding", "install", "--targets", "codex", "--project", setup.project]).status, 0);
+
+  const legacyHooksPath = path.join(setup.project, ".codex", "hooks.json");
+  const legacyBody = readFileSync(codexHooksPath(setup), "utf8");
+  mkdirSync(path.dirname(legacyHooksPath), { recursive: true });
+  writeFileSync(legacyHooksPath, legacyBody);
+  rmSync(codexHooksPath(setup), { force: true });
+  const state = stateFor(setup, "codex");
+  const legacyScope = state.scopes[0];
+  const formerTrustKey = legacyScope.codex_trust_key;
+  const legacyHooks = JSON.parse(legacyBody);
+  const indices = findSwitchboardHookIndices(legacyHooks, legacyScope.entry_b64);
+  const legacyTrustKey = codexHookStateKey(legacyHooksPath, indices.groupIndex, indices.handlerIndex);
   const repository = new LocalRepository({ home: setup.switchboardHome });
-  assert.notEqual(repository.authenticate(oldCredentials.client_id, oldCredentials.client_secret), null);
-  const oldRead = repository.read({
-    ...oldCredentials, categories: ["project"], query: sentinel, ambient: true,
-  });
-  assert.equal(oldRead.status, "results");
-  assert.equal(oldRead.rows.some((row) => row.content === sentinel), true);
+  legacyScope.scope_id = repository.scopeFingerprint(`coding-install:codex:project:${setup.project}`);
   repository.close();
-  const newCredentialHook = setup.run(["hook", "codex-prefetch"], { prompt: sentinel });
-  assert.equal(newCredentialHook.status, 0, newCredentialHook.stderr);
-  assert.match(JSON.parse(newCredentialHook.stdout).hookSpecificOutput.additionalContext, new RegExp(sentinel));
+  legacyScope.project = setup.project;
+  legacyScope.config = {
+    requested_path: path.resolve(legacyHooksPath), target_path: realpathSync(legacyHooksPath), topology: "file",
+  };
+  legacyScope.codex_trust_key = legacyTrustKey;
+  writeFileSync(path.join(setup.switchboardHome, "coding-installations", "codex.json"), `${JSON.stringify(state, null, 2)}\n`);
+  const trust = upsertTrustEntry(
+    removeTrustEntry(readFileSync(codexTrustPath(setup), "utf8"), formerTrustKey),
+    legacyTrustKey, codexHookTrustedHash(indices.handler),
+  );
+  writeFileSync(codexTrustPath(setup), trust);
 
-  const replacement = setup.run(["coding", "install", "--targets", "codex", "--project", secondProject]);
-  assert.equal(replacement.status, 0, replacement.stderr);
-  const committed = stateFor(setup, "codex");
-  assert.equal(committed.transaction, null);
-  assert.equal(committed.scopes.length, 2);
-  assert.equal(committed.scopes.every((installedScope) => installedScope.client_id === committed.client_id), true);
-  assert.notEqual(committed.client_id, oldCredentials.client_id);
-  const clients = new LocalRepository({ home: setup.switchboardHome });
-  assert.equal(clients.listClients().find((client) => client.client_id === oldCredentials.client_id).revoked_at !== null, true);
-  clients.close();
+  const status = setup.run(["coding", "status", "--project", setup.project]);
+  assert.equal(status.status, 0, status.stderr);
+  assert.match(status.stdout, /codex: installed=yes .*config=present.*hook_trust=ok/);
+  assert.equal(setup.run(["coding", "doctor", "--project", setup.project]).status, 0);
+  const otherStatus = setup.run(["coding", "status", "--project", otherProject]);
+  assert.match(otherStatus.stdout, /codex: installed=no \(1 other scope\)/);
+
+  assert.equal(setup.run(["coding", "install", "--targets", "codex", "--project", otherProject]).status, 0);
+  const coexisting = stateFor(setup, "codex");
+  assert.equal(coexisting.scopes.length, 2);
+  assert.equal(new Set(coexisting.scopes.map((scope) => scope.client_id)).size, 1);
+  assert.equal(activeInstallerRecords(setup, "codex").clients.length, 1);
+
+  const uninstallLegacy = setup.run(["coding", "uninstall", "--target", "codex", "--project", setup.project]);
+  assert.equal(uninstallLegacy.status, 0, uninstallLegacy.stderr);
+  assert.equal(readTrustEntry(readFileSync(codexTrustPath(setup), "utf8"), legacyTrustKey), null);
+  assert.equal(stateFor(setup, "codex").scopes.length, 1);
+  assert.equal(existsSync(codexHooksPath(setup)), true);
+  assert.equal(activeInstallerRecords(setup, "codex").clients.length, 1);
+
+  const uninstallUser = setup.run(["coding", "uninstall", "--target", "codex", "--project", otherProject]);
+  assert.equal(uninstallUser.status, 0, uninstallUser.stderr);
+  assert.equal(activeInstallerRecords(setup, "codex").clients.length, 0);
 });
 
 test("corrupt credentials revoke the superseded host client only after replacement commits", (t) => {
@@ -1114,7 +1159,7 @@ test("missing or corrupt install state makes uninstall fail closed", (t) => {
   hostStub(setup.bin, "codex");
   assert.equal(setup.run(["init"]).status, 0);
   assert.equal(setup.run(["coding", "install", "--targets", "codex", "--project", setup.project]).status, 0);
-  const config = path.join(setup.project, ".codex", "hooks.json");
+  const config = codexHooksPath(setup);
   const credentials = path.join(setup.ownerHome, ".local", "share", "switchboard", "codex-credentials.json");
   const configBefore = readFileSync(config, "utf8");
   const credentialBefore = readFileSync(credentials, "utf8");
