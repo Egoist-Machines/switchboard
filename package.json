@@ -1,0 +1,45 @@
+{
+  "name": "@egoistmachines/switchboard",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Egoist-Machines/switchboard.git"
+  },
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Switchboard: local-first, model-neutral memory for coding agents. Part of AI Passport.",
+  "license": "Apache-2.0",
+  "author": "Egoist Machines",
+  "homepage": "https://github.com/Egoist-Machines/switchboard#readme",
+  "bugs": {
+    "url": "https://github.com/Egoist-Machines/switchboard/issues"
+  },
+  "keywords": [
+    "switchboard",
+    "ai-passport",
+    "memory",
+    "mcp",
+    "opencode",
+    "claude-code",
+    "codex"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "exports": "./src/index.js",
+  "bin": {
+    "switchboard": "./src/cli.js"
+  },
+  "files": [
+    "src",
+    "LICENSE",
+    "README.md",
+    "DOCS.md",
+    "CONTRIBUTING.md"
+  ],
+  "scripts": {
+    "test": "node --test \"test/*.test.mjs\""
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.2.0"
+  }
+}
