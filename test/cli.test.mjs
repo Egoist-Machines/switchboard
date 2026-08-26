@@ -11,6 +11,7 @@ import { resolveSwitchboardHome } from "../src/storage.js";
 import { temporaryHome } from "./helpers.mjs";
 
 const cli = new URL("../src/cli.js", import.meta.url);
+const packageJson = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
 
 test("Switchboard home uses only the new override and ignores the removed override", () => {
   const removedHomeOverride = ["AI", "PASSPORT", "HOME"].join("_");
@@ -53,6 +54,17 @@ function projectCheckout(root, name, remote) {
   return directory;
 }
 
+test("version commands exit before opening the store", (t) => {
+  const home = temporaryHome(t);
+  writeFileSync(home, "not a directory");
+  for (const args of [["--version"], ["-v"], ["version"]]) {
+    const result = run(home, args);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout, `${packageJson.version}\n`);
+    assert.equal(result.stderr, "");
+  }
+});
+
 test("init is idempotent and creates private store and discovery files", (t) => {
   const home = temporaryHome(t);
   const first = run(home, ["init"]);
@@ -70,7 +82,7 @@ test("init is idempotent and creates private store and discovery files", (t) => 
   assert.match(first.stdout, /kept automatically/);
   assert.match(first.stdout, /Nothing leaves this machine/);
   assert.deepEqual(secondMetadata, firstMetadata);
-  assert.deepEqual({ ...firstRecord, bin: undefined }, { version: "0.1.0", home, transport: "cli", bin: undefined });
+  assert.deepEqual({ ...firstRecord, bin: undefined }, { version: packageJson.version, home, transport: "cli", bin: undefined });
   assert.equal(path.isAbsolute(firstRecord.bin), true);
   assert.equal(existsSync(firstRecord.bin), true);
   assert.equal(statSync(home).mode & 0o777, 0o700);

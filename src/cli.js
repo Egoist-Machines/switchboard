@@ -120,6 +120,7 @@ function writeDiscovery(home) {
 function printUsage() {
   process.stdout.write(`Usage: switchboard <command>\n\n` +
     "Commands: init, status, remember, recall, inbox, client, grant, profile, config, memory, handoff, link, unlink, sync [--replay-from <seq>], doctor, coding, hook, prefetch, propose, handoff-create, handoff-claim\n" +
+    "Version: switchboard --version, switchboard -v, switchboard version\n" +
     "Coding: switchboard coding import [--project <path>] [--dry-run]\n");
 }
 
@@ -217,6 +218,10 @@ async function runMachine(command, repository, preparedInput = null) {
 
 async function main(args = process.argv.slice(2)) {
   const command = args[0];
+  if (["--version", "-v", "version"].includes(command)) {
+    process.stdout.write(`${packageJson.version}\n`);
+    return 0;
+  }
   if (!command || has(args, "--help") || command === "help") {
     printUsage();
     return 0;
@@ -595,6 +600,7 @@ async function main(args = process.argv.slice(2)) {
       "UserPromptSubmit hooks must be an array",
       "OpenCode plugin installation failed",
       "OpenCode plugin entry already exists and is not managed by Switchboard",
+      ".opencode/package.json exists and is not valid JSON",
       "host config hooks must be an object",
       "UserPromptSubmit entries must contain a hooks array",
       "UserPromptSubmit contains an invalid hook entry",
