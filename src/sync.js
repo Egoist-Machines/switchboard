@@ -1200,6 +1200,7 @@ async function pushAll({ repository, link, key, fetchImpl, summary, onAfterUploa
     }
     if (!Number.isSafeInteger(uploadSeq) || uploadSeq < 0 || outcomes.length < 1 || outcomes.length > mapped.length ||
       outcomes.some((outcome, index) => !validateOutcome(outcome, mapped[index])) ||
+      outcomes.some((outcome, index) => CLAIM_REFUSAL_REASONS.has(outcome?.reason) && index !== outcomes.length - 1) ||
       (lastClaimed >= 0 && uploadSeq !== mapped[lastClaimed].upload_seq)) {
       throw new SyncTransportError("invalid_response");
     }

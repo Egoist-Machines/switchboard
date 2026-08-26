@@ -234,6 +234,29 @@ test("upload_seq must match the last claimed outcome", async (t) => {
   `).get().count, 3);
 });
 
+test("a claim refusal before the final outcome invalidates the response", async (t) => {
+  const repository = await repositoryFixture(t);
+  addPendingProposals(repository, 2);
+  let offered = [];
+  const fetchImpl = cycleFetch((call) => {
+    offered = call.body.events.map((event) => event.event_id);
+    return jsonResponse({
+      outcomes: [
+        { event_id: offered[0], status: "rejected", reason: "sequence_gap", retryable: true },
+        { event_id: offered[1], status: "accepted" },
+      ],
+      upload_seq: call.body.events[1].replica_seq,
+    });
+  });
+
+  const result = await syncOnce({ repository, fetchImpl });
+  assert.equal(result.status, "invalid_response");
+  assert.equal(result.pending, offered.length);
+  assert.deepEqual(repository.db.prepare(`
+    SELECT event_id, state FROM hosted_sync_uploads ORDER BY upload_seq
+  `).all(), offered.map((eventId) => ({ event_id: eventId, state: "pending" })));
+});
+
 for (const [name, response] of [
   ["invalid JSON", () => new Response("{", { status: 200, headers: { "content-type": "application/json" } })],
   ["an empty object", () => jsonResponse({})],

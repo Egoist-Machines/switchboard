@@ -485,7 +485,7 @@ function openCodeNodeModulesInventoryError(entries) {
     "Remove them or declare them in this directory's package.json before reinstalling.");
 }
 
-function assertTrackedOpenCodeNodeModules(directory, allowedPackages = []) {
+function assertTrackedOpenCodeNodeModules(directory, allowedPackages = [], mode = "install") {
   const nodeModulesPath = path.join(directory, "node_modules");
   let topLevel;
   try {
@@ -494,11 +494,14 @@ function assertTrackedOpenCodeNodeModules(directory, allowedPackages = []) {
     if (error?.code === "ENOENT") return;
     throw openCodeNodeModulesInventoryError(["node_modules inventory"]);
   }
-  if (!topLevel.length) return;
-
   const inventory = [];
   for (const item of topLevel) {
-    if (item.name.startsWith(".")) continue;
+    if (item.name.startsWith(".")) {
+      // npm reification leaves hidden entries alone, so they are not at risk during install.
+      if (mode === "install" || item.name === ".package-lock.json" || item.name === ".bin") continue;
+      inventory.push(item.name);
+      continue;
+    }
     if (!item.name.startsWith("@")) {
       inventory.push(item.name);
       continue;
@@ -511,6 +514,7 @@ function assertTrackedOpenCodeNodeModules(directory, allowedPackages = []) {
       inventory.push(item.name);
     }
   }
+  if (!inventory.length) return;
 
   let packages;
   try {
@@ -523,8 +527,11 @@ function assertTrackedOpenCodeNodeModules(directory, allowedPackages = []) {
   }
 
   const allowed = new Set(allowedPackages.filter(Boolean));
-  const untracked = inventory.filter((name) =>
-    !allowed.has(name) && !Object.hasOwn(packages, `node_modules/${name}`));
+  const untracked = inventory.filter((name) => {
+    if (mode === "uninstall" && name.startsWith(".")) return true;
+    const entry = packages[`node_modules/${name}`];
+    return entry?.extraneous === true || (!allowed.has(name) && !Object.hasOwn(packages, `node_modules/${name}`));
+  });
   if (untracked.length) throw openCodeNodeModulesInventoryError(untracked);
 }
 
@@ -694,7 +701,27 @@ function compensationRemediation(home, state, step, error) {
     return `${action} recorded in ${statePath(home, state.host)}, then run switchboard coding doctor`;
   }
   if (step === "package_restore") {
-    return `restore ${transaction.package?.package_json_path} from transaction.package.original_body_b64 and remove its recorded plugin directory, then run switchboard coding doctor`;
+    const record = transaction.package;
+    const directory = path.dirname(record.package_json_path);
+    const packagePath = openCodePaths(directory, record.plugin_name).package_path;
+    const actions = [];
+    if (record.previous_package_backup_path) {
+      actions.push(existsSync(record.previous_package_backup_path)
+        ? `rename ${record.previous_package_backup_path} to ${packagePath}`
+        : `verify ${record.previous_package_backup_path} has already been renamed to ${packagePath}`);
+    } else {
+      actions.push(`remove the Switchboard-created package directory ${packagePath}`);
+    }
+    if (record.removed_package_backup_path) {
+      const removedPackagePath = openCodePaths(directory, record.removed_plugin_name).package_path;
+      actions.push(existsSync(record.removed_package_backup_path)
+        ? `rename ${record.removed_package_backup_path} to ${removedPackagePath}`
+        : `verify ${record.removed_package_backup_path} has already been renamed to ${removedPackagePath}`);
+    }
+    actions.push(record.original_existed
+      ? `restore ${record.package_json_path} from transaction.package.original_body_b64`
+      : `remove the Switchboard-created manifest ${record.package_json_path}`);
+    return `${actions.join(", then ")}, then run switchboard coding doctor`;
   }
   if (step === "credential") {
     return `restore ${transaction.credential?.path} from transaction.credential in ${statePath(home, state.host)}, then run switchboard coding doctor`;
@@ -940,7 +967,7 @@ function uninstallOpenCodeDependency(scope, directory, snapshot = readOpenCodePa
   let removeGeneratedTree = scope.package_json_created && scope.node_modules_created === true &&
     !hasForeignDependencies;
   if (removeGeneratedTree) {
-    try { assertTrackedOpenCodeNodeModules(directory, [scope.plugin_name]); }
+    try { assertTrackedOpenCodeNodeModules(directory, [scope.plugin_name], "uninstall"); }
     catch { removeGeneratedTree = false; }
   }
   if (snapshot.existed && plainObject(snapshot.value.dependencies) &&
@@ -998,6 +1025,16 @@ function grantSummary(repository, clientId) {
 }
 
 function commitRemediation(home, state, step, error) {
+  if (step === "package_backup_cleanup") {
+    const backups = [
+      state.transaction?.package?.removed_package_backup_path,
+      state.transaction?.package?.previous_package_backup_path,
+    ].filter(Boolean);
+    const action = backups.length
+      ? `remove the OpenCode package backups ${backups.join(" and ")}`
+      : `remove the OpenCode package backups recorded in ${statePath(home, state.host)}`;
+    return `${action}, then run switchboard coding doctor (${error.message})`;
+  }
   const commit = state.transaction?.commit;
   return `verify ${commit?.credential_path} authenticates replacement client ${commit?.new_client_id}, ` +
     `that it has an active coding grant, and that every scope in ${statePath(home, state.host)} points to that client; ` +
