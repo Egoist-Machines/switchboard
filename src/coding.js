@@ -21,7 +21,9 @@ const HOOK_TIMEOUT_SECONDS = 2;
 const STATE_REMEDIATION = "Coding install state is missing or invalid; no changes were made. Re-run coding install to repair it.";
 const DEFAULT_OPENCODE_PLUGIN = Object.freeze({
   name: "@egoistmachines/opencode-switchboard",
-  spec: "@egoistmachines/opencode-switchboard@0.1.0",
+  // The spec is the dependency value written into .opencode/package.json,
+  // so it must be a plain pinned version, not a name@version specifier.
+  spec: "0.1.0",
 });
 const LEGACY_OPENCODE_PLUGIN_NAME = "opencode-ai-passport";
 
