@@ -64,6 +64,12 @@ function hostStub(directory, name) {
   chmodSync(target, 0o755);
 }
 
+function npmStub(directory, body) {
+  const target = path.join(directory, "npm");
+  writeFileSync(target, `#!/bin/sh\n${body}\n`, { mode: 0o755 });
+  chmodSync(target, 0o755);
+}
+
 function backupsFor(target) {
   const prefix = `${path.basename(target)}.switchboard-backup-`;
   return readdirSync(path.dirname(target)).filter((entry) => entry.startsWith(prefix));
@@ -249,6 +255,93 @@ test("Claude and Codex hooks merge, back up, verify, rerun idempotently, and uni
   const revokedRepository = new LocalRepository({ home: setup.switchboardHome });
   assert.ok(revokedRepository.listClients().every((client) => client.revoked_at));
   revokedRepository.close();
+});
+
+test("OpenCode npm install includes peer dependencies", (t) => {
+  const setup = fixture(t);
+  const npmArgs = path.join(setup.root, "npm-args");
+  hostStub(setup.bin, "opencode");
+  npmStub(setup.bin, `printf '%s\\n' "$@" > ${JSON.stringify(npmArgs)}
+mkdir -p "$PWD/node_modules/opencode-ai-passport/src"
+printf '%s\\n' '{"type":"module"}' > "$PWD/node_modules/opencode-ai-passport/package.json"
+printf '%s\\n' 'export function createLocalTransport() { return { prefetch: async () => ({ status: "results" }) }; }' > "$PWD/node_modules/opencode-ai-passport/src/localTransport.js"`);
+  assert.equal(setup.run(["init"]).status, 0);
+  const installed = setup.run(["coding", "install", "--targets", "opencode", "--project", setup.project]);
+  assert.equal(installed.status, 0, installed.stderr);
+  const args = readFileSync(npmArgs, "utf8").trim().split("\n");
+  assert.deepEqual(args, [
+    "install", "--no-save", "--package-lock=false", "--ignore-scripts", "--no-audit", "--no-fund", "opencode-ai-passport",
+  ]);
+  assert.equal(args.includes("--legacy-peer-deps"), false);
+});
+
+test("OpenCode npm failures include the final stderr lines", (t) => {
+  const setup = fixture(t);
+  hostStub(setup.bin, "opencode");
+  npmStub(setup.bin, "printf '%s\\n' first '' second third fourth >&2\nexit 1");
+  assert.equal(setup.run(["init"]).status, 0);
+  const installed = setup.run(["coding", "install", "--targets", "opencode", "--project", setup.project]);
+  assert.equal(installed.status, 1);
+  assert.match(installed.stderr, /OpenCode plugin installation failed: second; third; fourth/);
+  assert.match(installed.stderr, /opencode: install failed:/);
+});
+
+test("coding install continues after one host fails", (t) => {
+  const setup = fixture(t);
+  for (const host of ["claude", "opencode", "codex"]) hostStub(setup.bin, host);
+  npmStub(setup.bin, "printf '%s\\n' first '' second third fourth >&2\nexit 1");
+  assert.equal(setup.run(["init"]).status, 0);
+  const installed = setup.run([
+    "coding", "install", "--targets", "claude-code,opencode,codex", "--project", setup.project,
+  ]);
+  assert.equal(installed.status, 1);
+  assert.match(installed.stdout, /claude-code: client/);
+  assert.match(installed.stdout, /codex: client/);
+  assert.equal(stateFor(setup, "claude-code").scopes.length, 1);
+  assert.equal(stateFor(setup, "codex").scopes.length, 1);
+  assert.equal(installed.stderr,
+    "opencode: install failed: OpenCode plugin installation failed: second; third; fourth\n" +
+    "remediation: switchboard coding install --targets opencode --project .\n");
+});
+
+test("empty hook configs are not backed up", (t) => {
+  const setup = fixture(t);
+  const config = path.join(setup.project, ".codex", "hooks.json");
+  hostStub(setup.bin, "codex");
+  mkdirSync(path.dirname(config), { recursive: true });
+  writeFileSync(config, "{}\n");
+  assert.equal(setup.run(["init"]).status, 0);
+  assert.equal(setup.run(["coding", "install", "--targets", "codex", "--project", setup.project]).status, 0);
+  assert.equal(backupsFor(config).length, 0);
+  assert.equal(setup.run([
+    "coding", "uninstall", "--target", "codex", "--project", setup.project, "--keep-client",
+  ]).status, 0);
+  const backupsBeforeReinstall = backupsFor(config).length;
+  assert.equal(setup.run(["coding", "install", "--targets", "codex", "--project", setup.project]).status, 0);
+  assert.equal(backupsFor(config).length, backupsBeforeReinstall);
+
+  const foreign = fixture(t);
+  const foreignConfig = path.join(foreign.project, ".codex", "hooks.json");
+  hostStub(foreign.bin, "codex");
+  mkdirSync(path.dirname(foreignConfig), { recursive: true });
+  writeFileSync(foreignConfig, `${JSON.stringify({
+    hooks: { UserPromptSubmit: [{ hooks: [{ type: "command", command: "foreign-hook" }] }] },
+  }, null, 2)}\n`);
+  assert.equal(foreign.run(["init"]).status, 0);
+  assert.equal(foreign.run(["coding", "install", "--targets", "codex", "--project", foreign.project]).status, 0);
+  assert.equal(backupsFor(foreignConfig).length, 1);
+});
+
+test("coding status shows other installed scopes", (t) => {
+  const setup = fixture(t);
+  hostStub(setup.bin, "codex");
+  assert.equal(setup.run(["init"]).status, 0);
+  assert.equal(setup.run(["coding", "install", "--targets", "codex", "--project", setup.project]).status, 0);
+  const otherProject = path.join(setup.root, "other-project");
+  mkdirSync(otherProject);
+  const status = setup.run(["coding", "status", "--project", otherProject]);
+  assert.equal(status.status, 0, status.stderr);
+  assert.match(status.stdout, /codex: installed=no \(1 other scope\)/);
 });
 
 test("OpenCode install uses the packed plugin local transport and writes owner-present options", { skip: !hasOpencodeSibling }, (t) => {

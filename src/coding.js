@@ -96,6 +96,17 @@ function backup(target) {
   return candidate;
 }
 
+function emptyHookConfig(body) {
+  try {
+    const config = JSON.parse(body);
+    if (!plainObject(config)) return false;
+    const keys = Object.keys(config);
+    if (!keys.length) return true;
+    return keys.length === 1 && keys[0] === "hooks" && plainObject(config.hooks) &&
+      Object.values(config.hooks).every((groups) => Array.isArray(groups) && !groups.length);
+  } catch { return false; }
+}
+
 function atomicText(target, body, mode = 0o600) {
   mkdirSync(path.dirname(target), { recursive: true });
   const temporary = path.join(path.dirname(target), `.${path.basename(target)}.${process.pid}.tmp`);
@@ -252,7 +263,7 @@ function casJsonMutation(initial, merge, { env, beforeWrite } = {}) {
       continue;
     }
     beforeWrite?.(snapshot, body, merged.metadata ?? null);
-    if (snapshot.existed) backup(snapshot.identity.target_path);
+    if (snapshot.existed && !emptyHookConfig(snapshot.body)) backup(snapshot.identity.target_path);
     atomicText(snapshot.identity.target_path, body, snapshot.mode);
     return { original: snapshot, body, metadata: merged.metadata ?? null };
   }
@@ -639,11 +650,16 @@ function installOpenCodePackage(project, tarball, env, home, state) {
   injectAfterMutation(env, "package_rename");
   const specifier = tarball ? path.resolve(tarball) : "opencode-ai-passport";
   const result = spawnSync("npm", [
-    "install", "--no-save", "--package-lock=false", "--legacy-peer-deps", "--ignore-scripts", "--no-audit", "--no-fund", specifier,
+    "install", "--no-save", "--package-lock=false", "--ignore-scripts", "--no-audit", "--no-fund", specifier,
   ], {
     cwd: project, env, encoding: "utf8", timeout: 120_000, maxBuffer: 1024 * 1024,
   });
-  if (result.status !== 0 || result.error) throw new Error("OpenCode plugin installation failed");
+  if (result.status !== 0 || result.error) {
+    const output = (result.stderr || result.error?.message || "").trim();
+    const reason = output.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).slice(-3).join("; ") ||
+      `npm exited with status ${result.status}`;
+    throw new Error(`OpenCode plugin installation failed: ${reason}`);
+  }
 }
 
 function preflightConfig(host, target, previous) {
@@ -921,8 +937,20 @@ function install({ args, repository, home, binPath, env }) {
     plan.preflight = preflightConfig(plan.host, plan.paths.config, plan.previous);
   }
   const tarball = option(args, "--opencode-plugin-tarball");
-  for (const plan of plans) installOne({ plan, repository, home, binPath, env, tarball });
-  return 0;
+  const failures = [];
+  for (const plan of plans) {
+    try {
+      installOne({ plan, repository, home, binPath, env, tarball });
+    } catch (error) {
+      failures.push({ host: plan.host, message: String(error?.message ?? error).replace(/\s+/g, " ").trim() });
+    }
+  }
+  for (const failure of failures) process.stderr.write(`${failure.host}: install failed: ${failure.message}\n`);
+  if (!failures.length) return 0;
+  for (const failure of failures) {
+    process.stderr.write(`remediation: switchboard coding install --targets ${failure.host}${projectOption ? " --project ." : ""}\n`);
+  }
+  return 1;
 }
 
 function exactConfigPresent(host, scope) {
@@ -950,7 +978,9 @@ function status({ args, repository, home }) {
       ? repository.listClients().find((entry) => entry.client_id === state.client_id && !entry.revoked_at) : null;
     const grants = client ? grantSummary(repository, client.client_id) : [];
     const present = scope ? exactConfigPresent(host, scope) : false;
-    process.stdout.write(`${host}: installed=${scope ? "yes" : "no"} client=${client?.client_id ?? "none"} ` +
+    const installed = scope ? "yes" : state.scopes.length
+      ? `no (${state.scopes.length} other scope${state.scopes.length === 1 ? "" : "s"})` : "no";
+    process.stdout.write(`${host}: installed=${installed} client=${client?.client_id ?? "none"} ` +
       `grants=${grants.join(",") || "none"} config=${present ? "present" : "absent"} ` +
       `verification=${scope?.last_verification ?? "not_run"}\n`);
   }
