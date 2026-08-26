@@ -471,6 +471,27 @@ The first pull uses the hosted snapshot.
 
 Later pulls use ordered change pages from the last acknowledged cursor.
 
+A successful cycle has status `ok`. It may still report `pending` uploads when
+the hosted plane asks the client to retry an item or truncates a batch at a
+claim refusal. Those rows keep their event IDs and upload sequences and are
+offered again on the next cycle. The client stops pushing for the current cycle
+so it does not bypass hosted backoff.
+
+JSON summaries include `pending`, `content_rejected_rows`, and
+`failure_detail`. `pending` is the number of assigned upload rows still queued.
+Each `content_rejected_rows` entry contains `event_id`, `entity_id`, `category`,
+and `created_at`, never the rejected content. `failure_detail` is normally null
+and carries the local and server cursors for `cursor_desync`.
+
+Sync failures keep distinct statuses. `sync_refused` means the hosted plane
+refused the sync request. `ack_refused` means it refused the cursor
+acknowledgement. `invalid_response` means the response shape was not recognized.
+`pull_required_loop` means push remained fenced behind repeated pulls.
+`hosted_unavailable` means the hosted plane returned server errors.
+`cursor_desync` means the local and server cursors cannot be reconciled safely.
+Network failure, device approval, and client upgrade failures remain
+`network_failure`, `not_approved`, and `upgrade_required`.
+
 ### Sync capabilities
 
 The closed capability vocabulary is currently `null_tombstones`. It means the client can ingest tombstone fence rows whose hosted memory ID and category are null. The current Switchboard release declares every capability in the vocabulary when it mints a link ticket.
@@ -488,6 +509,13 @@ The response contains no row data. `switchboard sync` prints an instruction to u
 The server may require a new capability when it introduces another wire row shape. Old clients receive `upgrade_required` instead of a silently withheld row. Capabilities are not used to widen authorization, and the server does not silently deprecate a shape while devices still need an actionable upgrade path.
 
 Switchboard applies every page before it acknowledges the exact offered boundary.
+
+It retries an acknowledgement once after a network failure or server error. If
+an acknowledgement response was lost after the page committed locally, the
+next `cursor_not_current` response can move the local cursor forward only when
+every intervening change sequence is already recorded locally. The pull loop
+then continues from the reconciled cursor. A missing sequence, or a server
+cursor behind the local cursor, returns `cursor_desync` with both cursor values.
 
 It does not push while a deletion or account fence is unacknowledged.
 
@@ -524,12 +552,14 @@ replay makes the command safe to repeat. Final events return their existing
 outcomes, while pending content-bearing events rerun with the inline content
 still held by the device. If that content was deleted locally, Switchboard sends
 no content record and keeps the server's terminal outcome. Human output reports
-only replay, reemit, rejection, and conflict counts, followed by identifier-free
-guidance when action is needed. `switchboard sync --json` also carries opaque
-event, entity, and winner identifiers in `conflict_rows` so local integrators can
-automate recovery. It does not carry memory content, `save_id`-derived text,
-credentials, paths, or repository names. Other null-event rejection reasons fail
-closed and leave every offered upload pending.
+replay, reemit, rejection, pending, and conflict counts. A hosted content-screen
+rejection also prints one local edit-or-delete instruction with its category,
+creation time, and entity ID. `switchboard sync --json` carries opaque event,
+entity, and winner identifiers in `conflict_rows`, plus the local metadata in
+`content_rejected_rows`, so local integrators can automate recovery. It does not
+carry memory content, `save_id`-derived text, credentials, paths, or repository
+names. Other null-event rejection reasons fail closed and leave every offered
+upload pending.
 
 Review-mode proposals sync as pending proposals with separate content records.
 

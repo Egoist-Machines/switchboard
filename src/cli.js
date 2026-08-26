@@ -515,10 +515,19 @@ async function main(args = process.argv.slice(2)) {
       else if (result.status === "ok") {
         process.stdout.write(
           `pulled: ${result.pulled}\napplied: ${result.applied}\ntombstones: ${result.tombstones}\n` +
-          `pushed: ${result.pushed}\nrejected: ${result.rejected}\nreemitted: ${result.reemitted}\n` +
+          `pushed: ${result.pushed}\npending: ${result.pending}\nrejected: ${result.rejected}\nreemitted: ${result.reemitted}\n` +
           `superseded: ${result.superseded}\nconflicts: ${result.conflicts}\n` +
           `skipped: ${result.skipped}\nskipped_handoffs: ${result.skipped_handoffs}\nnew_cursor: ${result.new_cursor}\n`,
         );
+        for (const row of result.content_rejected_rows) {
+          const article = row.category === "instruction" ? "an" : "a";
+          const memory = row.category ? `${article} ${row.category} memory` : "a memory";
+          const created = row.created_at ? ` created ${row.created_at}` : " with an unknown creation time";
+          process.stdout.write(
+            `The hosted content screen rejected ${memory}${created} (entity ${row.entity_id}). ` +
+            "Edit or delete it locally, then run switchboard sync.\n",
+          );
+        }
         if (result.rejected > 0) {
           process.stdout.write(
             "Issue #916: A memory could not sync and stays local; re-save it to retry.\n" +

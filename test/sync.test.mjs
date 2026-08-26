@@ -740,7 +740,8 @@ test("the real hosted route and real sync client bridge the complete lifecycle",
   }, { owner: true });
   trustService.failNextProposal = true;
   const wedged = await syncOnce({ repository, fetchImpl });
-  assert.equal(wedged.status, "unavailable", "the failed effect leaves its claimed sequence pending on the server");
+  assert.equal(wedged.status, "ok", "the failed effect leaves its claimed sequence pending on the server");
+  assert.ok(wedged.pending > 0);
   const wedgeUpload = repository.db.prepare(`
     SELECT upload_seq FROM hosted_sync_uploads
     WHERE event_id = (SELECT event_id FROM events WHERE entity_id = ? AND op = 'proposal_created')
@@ -755,7 +756,8 @@ test("the real hosted route and real sync client bridge the complete lifecycle",
     content: "REAL_BRIDGE_UPLOAD_BEHIND_WEDGE",
   }, { owner: true });
   const blocked = await syncOnce({ repository, fetchImpl });
-  assert.equal(blocked.status, "unavailable");
+  assert.equal(blocked.status, "ok");
+  assert.equal(blocked.pending, 2);
   assert.equal(outcomePages.at(-1).outcomes[0].reason, "prior_pending");
 
   const replayed = await syncOnce({ repository, fetchImpl, replayFrom: wedgeUpload.upload_seq });
@@ -999,7 +1001,7 @@ test("the real hosted route and real sync client bridge the complete lifecycle",
     content: "REAL_BRIDGE_RECORDED_REJECTION_STAYS_LOCAL",
   }, { owner: true });
   const firstRejectedCycle = await syncOnce({ repository, fetchImpl });
-  assert.equal(firstRejectedCycle.status, "unavailable", "the first invalid_event response remains fail-closed");
+  assert.equal(firstRejectedCycle.status, "invalid_response", "the first invalid_event response remains fail-closed");
   const firstRejectedPage = outcomePages.at(-1);
   assert.equal(firstRejectedPage.outcomes[1].event_id !== null, true, "the initial apply rejection is not a recorded replay");
   assert.equal(firstRejectedPage.outcomes[1].reason, "invalid_event");
@@ -1070,7 +1072,7 @@ test("the real hosted route and real sync client bridge the complete lifecycle",
   }, { owner: true });
   const deletedMemoryId = repository.db.prepare("SELECT memory_id FROM proposals WHERE proposal_id = ?")
     .get(deletedRejectedSave.proposal_id).memory_id;
-  assert.equal((await syncOnce({ repository, fetchImpl })).status, "unavailable");
+  assert.equal((await syncOnce({ repository, fetchImpl })).status, "invalid_response");
   assert.deepEqual(repository.deleteMemory(deletedMemoryId), { status: "deleted", memory_id: deletedMemoryId });
   const deletedRecorded = await syncOnce({ repository, fetchImpl });
   assert.equal(deletedRecorded.status, "ok");
@@ -1099,7 +1101,7 @@ test("the real hosted route and real sync client bridge the complete lifecycle",
   }, { owner: true });
   corruptNextUploadBeforeClaim = true;
   const freshRejected = await syncOnce({ repository, fetchImpl });
-  assert.equal(freshRejected.status, "unavailable");
+  assert.equal(freshRejected.status, "invalid_response");
   assert.equal(freshRejected.rejected, 0);
   assert.equal(outcomePages.at(-1).outcomes[0].event_id === null, false, "fresh pre-claim rejection retains its event id");
   assert.equal(outcomePages.at(-1).outcomes[0].reason, "invalid_event");
@@ -1160,7 +1162,8 @@ test("a recorded terminal creation rejection settles its replayed dependent and 
   trustService.rejectNextProposal = true;
   store.hideCreationOutcomeOnce.add(store.key(BRIDGE_USER, saved.proposal_id));
   const interrupted = await syncOnce({ repository, fetchImpl });
-  assert.equal(interrupted.status, "unavailable", "the first transient lookup remains fail-closed");
+  assert.equal(interrupted.status, "ok", "the first transient lookup remains queued");
+  assert.equal(interrupted.pending, 1);
   assert.deepEqual(outcomePages.at(-1).outcomes.map((outcome) => [outcome.reason, outcome.retryable ?? false]), [
     ["content_rejected", false],
     ["dependency_unavailable", true],
@@ -1178,11 +1181,11 @@ test("a recorded terminal creation rejection settles its replayed dependent and 
       assert.equal(repository.deleteMemory(memory.memory_id).status, "deleted");
     },
   });
-  assert.equal(unfenced.status, "unavailable", "an empty tombstone RPC row keeps the deletion retryable");
+  assert.equal(unfenced.status, "ok", "an empty tombstone RPC row keeps the deletion retryable");
+  assert.equal(unfenced.pending, 1);
   assert.equal(await store.getTombstone({ userId: BRIDGE_USER, entityId: saved.proposal_id }), null);
   assert.deepEqual(outcomePages.slice(pagesBeforeReplay).flatMap((page) => page.outcomes)
     .map((outcome) => [outcome.status, outcome.reason || null, outcome.retryable ?? false]), [
-    ["rejected", "content_rejected", false],
     ["rejected", "dependency_rejected", false],
     ["rejected", "dependency_unavailable", true],
   ]);
@@ -2853,7 +2856,7 @@ test("invalid or cross-kind pull rows fail transactionally before ack and push",
         throw new Error("unexpected request");
       });
       const result = await syncOnce({ repository, fetchImpl });
-      assert.equal(result.status, "unavailable");
+      assert.equal(result.status, "invalid_response");
       assert.equal(result.pulled, 0);
       assert.equal(result.applied, 0);
       assert.equal(acknowledgements, 0);
@@ -3022,7 +3025,7 @@ test("upload completion requires a closed outcome and proven hosted sequence", a
         throw new Error("unexpected request");
       });
       const result = await syncOnce({ repository, fetchImpl });
-      assert.equal(result.status, "unavailable");
+      assert.equal(result.status, "invalid_response");
       assert.equal(result.rejected, 0);
       assert.deepEqual(offeredEvents.map((event) => event.replica_seq), [1, 2]);
       assert.equal(repository.db.prepare("SELECT count(*) AS count FROM hosted_sync_uploads WHERE state = 'pending'").get().count, 2);
@@ -3087,10 +3090,10 @@ test("a memory feed row resolves through its hosted proposal and approves the or
 
 test("invalid cursors never mutate local state or permit upload", async (t) => {
   const cases = [
-    { name: "regression", prepare(repository) { repository.db.prepare("UPDATE hosted_sync_state SET download_cursor = '5'").run(); }, response: () => jsonResponse(emptyPage("4")), urlCursor: "5", calls: 1 },
-    { name: "signed bigint overflow", response: () => jsonResponse(emptyPage("9223372036854775808")), urlCursor: "0", calls: 1 },
-    { name: "unchanged cursor with more pages", response: () => jsonResponse({ ...emptyPage("0"), has_more: true }), urlCursor: "0", calls: 3 },
-    { name: "unexpected future reconciliation", response: () => jsonResponse({ error: "cursor_not_current", cursor: "9" }, 409), urlCursor: "0", calls: 1 },
+    { name: "regression", status: "invalid_response", prepare(repository) { repository.db.prepare("UPDATE hosted_sync_state SET download_cursor = '5'").run(); }, response: () => jsonResponse(emptyPage("4")), urlCursor: "5", calls: 1 },
+    { name: "signed bigint overflow", status: "invalid_response", response: () => jsonResponse(emptyPage("9223372036854775808")), urlCursor: "0", calls: 1 },
+    { name: "unchanged cursor with more pages", status: "invalid_response", response: () => jsonResponse({ ...emptyPage("0"), has_more: true }), urlCursor: "0", calls: 3 },
+    { name: "unexpected future reconciliation", status: "cursor_desync", response: () => jsonResponse({ error: "cursor_not_current", cursor: "9" }, 409), urlCursor: "0", calls: 1 },
   ];
   for (const entry of cases) {
     await t.test(entry.name, async (subtest) => {
@@ -3119,7 +3122,7 @@ test("invalid cursors never mutate local state or permit upload", async (t) => {
         throw new Error("unexpected request");
       });
       const result = await syncOnce({ repository, fetchImpl });
-      assert.equal(result.status, "unavailable");
+      assert.equal(result.status, entry.status);
       assert.equal(pulls, entry.calls);
       assert.equal(acknowledgements, 0);
       assert.equal(uploads, 0);
