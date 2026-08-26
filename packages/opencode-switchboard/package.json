@@ -1,0 +1,38 @@
+{
+  "name": "@egoistmachines/opencode-switchboard",
+  "version": "0.1.2",
+  "type": "module",
+  "description": "Local-first AI Passport memory for OpenCode.",
+  "license": "Apache-2.0",
+  "author": "Egoist Machines",
+  "homepage": "https://ego.ist",
+  "bugs": {
+    "url": "https://ego.ist/support"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "ai-passport",
+    "memory",
+    "mcp"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "exports": "./src/index.js",
+  "bin": {
+    "opencode-ai-passport": "./src/cli.js"
+  },
+  "files": [
+    "src",
+    "src/shared",
+    "config.schema.json",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test \"test/*.test.mjs\""
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "1.18.22"
+  }
+}

@@ -95,5 +95,6 @@ See the [sync reference](DOCS.md#sync-reference) for headless linking, replay, a
 - [Project identity and scoped injection](DOCS.md#project-identity-and-scoped-injection)
 - [Storage and privacy](DOCS.md#storage-and-privacy)
 - [Hosted sync](DOCS.md#sync-reference)
+- [OpenCode plugin package](packages/opencode-switchboard/README.md)
 - [Contributing](CONTRIBUTING.md)
 - [Apache License 2.0](LICENSE)

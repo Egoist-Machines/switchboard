@@ -23,7 +23,7 @@ const DEFAULT_OPENCODE_PLUGIN = Object.freeze({
   name: "@egoistmachines/opencode-switchboard",
   // The spec is the dependency value written into .opencode/package.json,
   // so it must be a plain pinned version, not a name@version specifier.
-  spec: "0.1.1",
+  spec: "0.1.2",
 });
 const LEGACY_OPENCODE_PLUGIN_NAME = "opencode-ai-passport";
 const NPM_PACKAGE_NAME = /^(@[a-z0-9-~][a-z0-9-._~]*\/)?[a-z0-9-~][a-z0-9-._~]*$/;

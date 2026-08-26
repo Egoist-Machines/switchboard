@@ -16,12 +16,10 @@ import { LocalRepository } from "../src/repository.js";
 import { resolveProjectScope } from "../src/projectIdentity.js";
 
 const cli = new URL("../src/cli.js", import.meta.url);
-const opencodePackage = new URL("../../opencode-passport", import.meta.url);
-// The OpenCode plugin lives in the Egoist Machines monorepo beside this
-// package; its integration seam only runs there.
+const opencodePackage = new URL("../packages/opencode-switchboard", import.meta.url);
 const hasOpencodeSibling = existsSync(opencodePackage);
 const formatMemoryBlock = hasOpencodeSibling
-  ? (await import("../../opencode-passport/src/context.js")).formatMemoryBlock
+  ? (await import("../packages/opencode-switchboard/src/context.js")).formatMemoryBlock
   : null;
 
 function fixture(t) {
@@ -650,7 +648,8 @@ test("Codex install succeeds when user hook trust cannot be written", (t) => {
   assert.match(install.stderr, /codex: hook trust could not be recorded: .* Open codex in this project and trust the hook via \/hooks\./);
 });
 
-test("OpenCode install uses the packed plugin local transport and writes owner-present options", { skip: !hasOpencodeSibling }, (t) => {
+// This test fetches from the npm registry and is skipped by SWITCHBOARD_OFFLINE=1.
+test("OpenCode install uses the packed plugin local transport and writes owner-present options", { skip: !hasOpencodeSibling || process.env.SWITCHBOARD_OFFLINE === "1" }, (t) => {
   const setup = fixture(t);
   hostStub(setup.bin, "opencode");
   assert.equal(setup.run(["init"]).status, 0);
