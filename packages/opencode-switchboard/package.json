@@ -1,5 +1,10 @@
 {
   "name": "@egoistmachines/opencode-switchboard",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Egoist-Machines/switchboard.git",
+    "directory": "packages/opencode-switchboard"
+  },
   "version": "0.1.2",
   "type": "module",
   "description": "Local-first AI Passport memory for OpenCode.",
