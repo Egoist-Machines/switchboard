@@ -342,6 +342,56 @@ test("OpenCode tarball install derives the package name and file spec", (t) => {
   assert.equal(readFileSync(path.join(setup.project, ".opencode", "plugin", "ai-passport.js"), "utf8"), opencodeEntry(pluginName));
 });
 
+test("OpenCode tarball reinstalls reconcile a renamed Switchboard dependency", (t) => {
+  const setup = fixture(t);
+  const firstName = "@fixture/one";
+  const secondName = "@fixture/two";
+  const firstTarball = pluginTarball(setup, firstName);
+  hostStub(setup.bin, "opencode");
+  npmPluginStub(setup.bin, firstName);
+  assert.equal(setup.run(["init"]).status, 0);
+  assert.equal(setup.run([
+    "coding", "install", "--targets", "opencode", "--project", setup.project,
+    "--opencode-plugin-tarball", firstTarball,
+  ]).status, 0);
+  assert.equal(existsSync(path.join(setup.project, ".opencode", "node_modules", firstName, "package.json")), true);
+
+  const secondTarball = pluginTarball(setup, secondName);
+  npmPluginStub(setup.bin, secondName);
+  const reinstalled = setup.run([
+    "coding", "install", "--targets", "opencode", "--project", setup.project,
+    "--opencode-plugin-tarball", secondTarball,
+  ]);
+  assert.equal(reinstalled.status, 0, reinstalled.stderr);
+  const packageJsonPath = path.join(setup.project, ".opencode", "package.json");
+  assert.deepEqual(JSON.parse(readFileSync(packageJsonPath, "utf8")).dependencies, {
+    [secondName]: `file:${path.resolve(secondTarball)}`,
+  });
+  assert.equal(existsSync(path.join(setup.project, ".opencode", "node_modules", firstName)), false);
+  assert.equal(existsSync(path.join(setup.project, ".opencode", "node_modules", secondName, "package.json")), true);
+
+  const uninstall = setup.run(["coding", "uninstall", "--target", "opencode", "--project", setup.project]);
+  assert.equal(uninstall.status, 0, uninstall.stderr);
+  assert.equal(existsSync(packageJsonPath), false);
+  assert.equal(existsSync(path.join(setup.project, ".opencode", "node_modules", secondName)), false);
+});
+
+test("OpenCode rejects unsafe tarball package names", (t) => {
+  for (const pluginName of ["../evil", "Uppercase"]) {
+    const setup = fixture(t);
+    const tarball = pluginTarball(setup, pluginName);
+    hostStub(setup.bin, "opencode");
+    assert.equal(setup.run(["init"]).status, 0);
+    const installed = setup.run([
+      "coding", "install", "--targets", "opencode", "--project", setup.project,
+      "--opencode-plugin-tarball", tarball,
+    ]);
+    assert.equal(installed.status, 2, pluginName);
+    assert.equal(installed.stderr, "Command could not be completed.\n");
+    assert.equal(existsSync(path.join(setup.switchboardHome, "coding-installations", "opencode.json")), false);
+  }
+});
+
 test("OpenCode merges and backs up a user package.json only once", (t) => {
   const setup = fixture(t);
   const packageJsonPath = path.join(setup.project, ".opencode", "package.json");
@@ -379,12 +429,40 @@ test("OpenCode rejects an invalid managed package.json before mutation", (t) => 
   assert.equal(setup.run(["init"]).status, 0);
 
   const installed = setup.run(["coding", "install", "--targets", "opencode", "--project", setup.project]);
-  assert.equal(installed.status, 2);
-  assert.equal(installed.stderr, ".opencode/package.json exists and is not valid JSON\n");
+  assert.equal(installed.status, 1);
+  assert.match(installed.stderr, /opencode: install failed: \.opencode\/package\.json exists and is not valid JSON/);
+  assert.match(installed.stderr, /remediation: switchboard coding install --targets opencode --project \./);
   assert.equal(readFileSync(packageJsonPath, "utf8"), "{not valid JSON\n");
   assert.equal(backupsFor(packageJsonPath).length, 0);
   assert.equal(existsSync(npmCalled), false);
   assert.equal(existsSync(path.join(setup.switchboardHome, "coding-installations", "opencode.json")), false);
+});
+
+test("OpenCode uninstall fails closed when its package manifest is corrupt", (t) => {
+  const setup = fixture(t);
+  hostStub(setup.bin, "opencode");
+  npmPluginStub(setup.bin);
+  assert.equal(setup.run(["init"]).status, 0);
+  assert.equal(setup.run(["coding", "install", "--targets", "opencode", "--project", setup.project]).status, 0);
+  const entryPath = path.join(setup.project, ".opencode", "plugin", "ai-passport.js");
+  const packageJsonPath = path.join(setup.project, ".opencode", "package.json");
+  const packagePath = path.join(setup.project, ".opencode", "node_modules", DEFAULT_OPENCODE_PLUGIN.name);
+  const credentialPath = path.join(setup.opencodeState, "switchboard-credentials.json");
+  const entryBefore = readFileSync(entryPath, "utf8");
+  const stateBefore = readFileSync(path.join(setup.switchboardHome, "coding-installations", "opencode.json"), "utf8");
+  const credentialBefore = readFileSync(credentialPath, "utf8");
+  const packageBefore = readFileSync(path.join(packagePath, "package.json"), "utf8");
+  const corrupt = "{not valid JSON\n";
+  writeFileSync(packageJsonPath, corrupt);
+
+  const uninstall = setup.run(["coding", "uninstall", "--target", "opencode", "--project", setup.project]);
+  assert.equal(uninstall.status, 2);
+  assert.equal(uninstall.stderr, ".opencode/package.json exists and is not valid JSON\n");
+  assert.equal(readFileSync(entryPath, "utf8"), entryBefore);
+  assert.equal(readFileSync(packageJsonPath, "utf8"), corrupt);
+  assert.equal(readFileSync(path.join(packagePath, "package.json"), "utf8"), packageBefore);
+  assert.equal(readFileSync(path.join(setup.switchboardHome, "coding-installations", "opencode.json"), "utf8"), stateBefore);
+  assert.equal(readFileSync(credentialPath, "utf8"), credentialBefore);
 });
 
 test("OpenCode npm failures include the final stderr lines", (t) => {
@@ -663,7 +741,7 @@ test("a missing recorded command is repaired while a prefixed replacement is ref
   const prefixedBody = `${JSON.stringify(config, null, 2)}\n`;
   writeFileSync(configPath, prefixedBody);
   const refused = setup.run(["coding", "install", "--targets", "codex", "--project", setup.project]);
-  assert.equal(refused.status, 2);
+  assert.equal(refused.status, 1);
   assert.match(refused.stderr, /recorded hook changed/);
   assert.equal(readFileSync(configPath, "utf8"), prefixedBody);
 
@@ -969,7 +1047,7 @@ test("changed config leaves resumable recovery for doctor with exact remediation
   assert.equal(stateFor(setup, "codex").transaction, null);
 });
 
-test("every malformed hook config shape fails before any target mutation", (t) => {
+test("every malformed hook config shape isolates its host preflight failure", (t) => {
   const malformed = [
     [],
     { hooks: null },
@@ -982,24 +1060,62 @@ test("every malformed hook config shape fails before any target mutation", (t) =
     { hooks: { UserPromptSubmit: [{ hooks: [{}] }] } },
     { hooks: { UserPromptSubmit: [{ hooks: [{ type: "command" }] }] } },
   ];
-  const setup = fixture(t);
-  hostStub(setup.bin, "claude");
-  hostStub(setup.bin, "codex");
-  assert.equal(setup.run(["init"]).status, 0);
-  const claudePath = path.join(setup.ownerHome, ".claude", "settings.json");
-  const codexPath = codexHooksPath(setup);
-  mkdirSync(path.dirname(codexPath), { recursive: true });
   for (const value of malformed) {
-    rmSync(path.dirname(claudePath), { recursive: true, force: true });
+    const setup = fixture(t);
+    hostStub(setup.bin, "claude");
+    hostStub(setup.bin, "codex");
+    assert.equal(setup.run(["init"]).status, 0);
+    const claudePath = path.join(setup.project, ".claude", "settings.json");
+    const codexPath = codexHooksPath(setup);
+    mkdirSync(path.dirname(codexPath), { recursive: true });
     const body = `${JSON.stringify(value, null, 2)}\n`;
     writeFileSync(codexPath, body);
     const result = setup.run(["coding", "install", "--targets", "claude-code,codex", "--project", setup.project]);
-    assert.equal(result.status, 2, JSON.stringify(value));
+    assert.equal(result.status, 1, JSON.stringify(value));
+    assert.match(result.stdout, /claude-code: client/);
+    assert.match(result.stderr, /codex: install failed:/);
+    assert.match(result.stderr, /remediation: switchboard coding install --targets codex --project \./);
     assert.equal(readFileSync(codexPath, "utf8"), body);
-    assert.equal(existsSync(claudePath), false);
+    assert.equal(existsSync(claudePath), true);
     assert.equal(activeInstallerRecords(setup, "codex").clients.length, 0);
-    assert.equal(activeInstallerRecords(setup, "claude-code").clients.length, 0);
+    assert.equal(activeInstallerRecords(setup, "claude-code").clients.length, 1);
   }
+});
+
+test("Codex trust recovery restores config.toml after a trust-write crash", (t) => {
+  const setup = fixture(t);
+  hostStub(setup.bin, "codex");
+  const trustPath = codexTrustPath(setup);
+  const originalTrust = "model = \"gpt-5\"\r\n# Keep this config byte-for-byte.\r\n";
+  mkdirSync(path.dirname(trustPath), { recursive: true });
+  writeFileSync(trustPath, originalTrust);
+  assert.equal(setup.run(["init"]).status, 0);
+
+  const crashed = setup.run(
+    ["coding", "install", "--targets", "codex", "--project", setup.project],
+    null,
+    { SWITCHBOARD_CODING_CRASH_AFTER_MUTATION: "trust_write" },
+  );
+  assert.equal(crashed.status, 86, crashed.stderr);
+  assert.notEqual(readFileSync(trustPath, "utf8"), originalTrust);
+  const transaction = stateFor(setup, "codex").transaction;
+  assert.equal(transaction.phase, "trust_recorded");
+  assert.deepEqual(transaction.trust, {
+    path: trustPath,
+    existed: true,
+    body_b64: Buffer.from(originalTrust, "utf8").toString("base64"),
+    mode: 0o644,
+  });
+
+  const recovered = setup.run(["coding", "status", "--project", setup.project]);
+  assert.equal(recovered.status, 0, recovered.stderr);
+  assert.equal(readFileSync(trustPath, "utf8"), originalTrust);
+  assert.equal(stateFor(setup, "codex").transaction, null);
+
+  const reinstalled = setup.run(["coding", "install", "--targets", "codex", "--project", setup.project]);
+  assert.equal(reinstalled.status, 0, reinstalled.stderr);
+  assert.equal(stateFor(setup, "codex").scopes.length, 1);
+  assert.equal(setup.run(["coding", "doctor", "--project", setup.project]).status, 0);
 });
 
 test("Codex user-scope reruns do not duplicate its hook, backup, or trust entry", (t) => {

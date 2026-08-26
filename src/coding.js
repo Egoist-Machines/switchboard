@@ -26,6 +26,7 @@ const DEFAULT_OPENCODE_PLUGIN = Object.freeze({
   spec: "0.1.0",
 });
 const LEGACY_OPENCODE_PLUGIN_NAME = "opencode-ai-passport";
+const NPM_PACKAGE_NAME = /^(@[a-z0-9-~][a-z0-9-._~]*\/)?[a-z0-9-~][a-z0-9-._~]*$/;
 
 function opencodeEntry(pluginName) {
   return `import { AIPassportPlugin } from "${pluginName}";
@@ -453,6 +454,21 @@ function managedOpenCodePackageBody(snapshot, pluginName, pluginSpec) {
   return `${JSON.stringify(value, null, 2)}\n`;
 }
 
+function replacedOpenCodePlugin(snapshot, plugin, previous) {
+  const previousPluginName = previous?.plugin_name;
+  if (!previousPluginName || previousPluginName === plugin.name || !plainObject(snapshot.value?.dependencies)) return null;
+  return snapshot.value.dependencies[previousPluginName] === previous.plugin_spec ? previousPluginName : null;
+}
+
+function reconciledOpenCodePackageBody(snapshot, plugin, removedPluginName) {
+  if (!snapshot.existed) return managedOpenCodePackageBody(snapshot, plugin.name, plugin.spec);
+  const value = structuredClone(snapshot.value);
+  if (!plainObject(value.dependencies)) value.dependencies = {};
+  if (removedPluginName) delete value.dependencies[removedPluginName];
+  value.dependencies[plugin.name] = plugin.spec;
+  return `${JSON.stringify(value, null, 2)}\n`;
+}
+
 function switchboardManagedOpenCodePackage(snapshot, pluginName, pluginSpec) {
   return snapshot.existed && (snapshot.body === managedOpenCodePackageBody(snapshot, pluginName, pluginSpec) ||
     snapshot.body === `${JSON.stringify({ dependencies: { [pluginName]: pluginSpec } })}\n`);
@@ -467,7 +483,9 @@ function resolveOpenCodePlugin(tarball) {
     });
     if (result.status !== 0 || result.error) throw new Error("tar failed");
     const { name } = JSON.parse(result.stdout);
-    if (typeof name !== "string" || !name) throw new Error("missing package name");
+    if (typeof name !== "string" || name.length > 214 || !NPM_PACKAGE_NAME.test(name)) {
+      throw new Error("invalid package name");
+    }
     return { name, spec: `file:${archive}` };
   } catch {
     throw new Error("OpenCode plugin tarball is unreadable");
@@ -565,6 +583,9 @@ function compensationRemediation(home, state, step, error) {
   if (step === "credential") {
     return `restore ${transaction.credential?.path} from transaction.credential in ${statePath(home, state.host)}, then run switchboard coding doctor`;
   }
+  if (step === "trust") {
+    return `restore ${transaction.trust?.path} from transaction.trust in ${statePath(home, state.host)}, then run switchboard coding doctor`;
+  }
   return `resolve ${error.message} in the local client/grant store, then run switchboard coding doctor`;
 }
 
@@ -578,6 +599,10 @@ function rollbackTransaction(repository, home, state, env = process.env) {
 
   const steps = [];
   if (transaction.config?.installed_body_b64) steps.push(["config", () => restoreConfig(transaction.config)]);
+  if (transaction.trust) steps.push(["trust", () => {
+    if (!fileMatchesSnapshot(transaction.trust)) restoreFile(transaction.trust);
+    if (!fileMatchesSnapshot(transaction.trust)) throw new Error("Codex trust restoration did not verify");
+  }]);
   if (transaction.package) steps.push(["package_restore", () => restoreOpenCodeDependency(transaction.package)]);
   if (transaction.credential_write) steps.push(["credential", () => {
     if (!fileMatchesSnapshot(transaction.credential)) restoreFile(transaction.credential);
@@ -681,15 +706,17 @@ function verifyOpenCode({ project, home, credentialPath, env, pluginName = DEFAU
   } catch { return "failed_adapter"; }
 }
 
-function installOpenCodeDependency(project, plugin, env, home, state) {
+function installOpenCodeDependency(project, plugin, env, home, state, previous) {
   const snapshot = readOpenCodePackageJson(project);
   const { directory, package_json_path: packageJsonPath, package_path: packagePath } = openCodePaths(project, plugin.name);
-  const installedBody = managedOpenCodePackageBody(snapshot, plugin.name, plugin.spec);
+  const removedPluginName = replacedOpenCodePlugin(snapshot, plugin, previous);
+  const installedBody = reconciledOpenCodePackageBody(snapshot, plugin, removedPluginName);
   const record = {
     package_json_path: packageJsonPath,
     package_json_created: !snapshot.existed,
     plugin_name: plugin.name,
     plugin_spec: plugin.spec,
+    ...(removedPluginName ? { removed_plugin_name: removedPluginName } : {}),
     original_existed: snapshot.existed,
     original_body_b64: encode(snapshot.body),
     original_mode: snapshot.mode,
@@ -698,7 +725,9 @@ function installOpenCodeDependency(project, plugin, env, home, state) {
   journalPhase(home, state, "package_json_prepared", { package: record });
   mkdirSync(directory, { recursive: true });
   if (!snapshot.existed || snapshot.body !== installedBody) {
-    if (snapshot.existed && !switchboardManagedOpenCodePackage(snapshot, plugin.name, plugin.spec)) backup(packageJsonPath);
+    const alreadyManaged = switchboardManagedOpenCodePackage(snapshot, plugin.name, plugin.spec) ||
+      Boolean(previous?.plugin_name && switchboardManagedOpenCodePackage(snapshot, previous.plugin_name, previous.plugin_spec));
+    if (snapshot.existed && !alreadyManaged) backup(packageJsonPath);
     atomicText(packageJsonPath, installedBody, snapshot.mode);
   }
   injectAfterMutation(env, "package_json_write");
@@ -717,27 +746,25 @@ function installOpenCodeDependency(project, plugin, env, home, state) {
   if (!existsSync(path.join(packagePath, "package.json"))) {
     throw new Error("OpenCode plugin installation failed: package missing after npm install");
   }
+  if (removedPluginName) {
+    rmSync(openCodePaths(project, removedPluginName).package_path, { recursive: true, force: true });
+  }
   return record;
 }
 
-function uninstallOpenCodeDependency(scope) {
+function uninstallOpenCodeDependency(scope, snapshot = readOpenCodePackageJson(scope.project)) {
   const { package_json_path: packageJsonPath, package_path: packagePath } = openCodePaths(scope.project, scope.plugin_name);
-  try {
-    const snapshot = readOpenCodePackageJson(scope.project);
-    if (snapshot.existed && plainObject(snapshot.value.dependencies) &&
-        Object.hasOwn(snapshot.value.dependencies, scope.plugin_name)) {
-      const managed = switchboardManagedOpenCodePackage(snapshot, scope.plugin_name, scope.plugin_spec);
-      const value = structuredClone(snapshot.value);
-      delete value.dependencies[scope.plugin_name];
-      const onlyEmptyDependencies = Object.keys(value).length === 1 && Object.hasOwn(value, "dependencies") &&
-        plainObject(value.dependencies) && !Object.keys(value.dependencies).length;
-      if (!managed) backup(packageJsonPath);
-      if (scope.package_json_created && onlyEmptyDependencies) {
-        try { unlinkSync(packageJsonPath); } catch (error) { if (error?.code !== "ENOENT") throw error; }
-      } else atomicText(packageJsonPath, `${JSON.stringify(value, null, 2)}\n`, snapshot.mode);
-    }
-  } catch (error) {
-    if (error?.message !== ".opencode/package.json exists and is not valid JSON") throw error;
+  if (snapshot.existed && plainObject(snapshot.value.dependencies) &&
+      Object.hasOwn(snapshot.value.dependencies, scope.plugin_name)) {
+    const managed = switchboardManagedOpenCodePackage(snapshot, scope.plugin_name, scope.plugin_spec);
+    const value = structuredClone(snapshot.value);
+    delete value.dependencies[scope.plugin_name];
+    const onlyEmptyDependencies = Object.keys(value).length === 1 && Object.hasOwn(value, "dependencies") &&
+      plainObject(value.dependencies) && !Object.keys(value.dependencies).length;
+    if (!managed) backup(packageJsonPath);
+    if (scope.package_json_created && onlyEmptyDependencies) {
+      try { unlinkSync(packageJsonPath); } catch (error) { if (error?.code !== "ENOENT") throw error; }
+    } else atomicText(packageJsonPath, `${JSON.stringify(value, null, 2)}\n`, snapshot.mode);
   }
   rmSync(packagePath, { recursive: true, force: true });
 }
@@ -830,7 +857,7 @@ function finalizeTransactionCommit(repository, home, state, env = process.env) {
   return true;
 }
 
-function recordCodexHookTrust({ hooksJsonPath, entryB64, previous, env }) {
+function recordCodexHookTrust({ hooksJsonPath, entryB64, previous, env, home, state }) {
   const snapshot = configSnapshot(hooksJsonPath);
   if (!snapshot.existed) throw new Error("hooks.json was not found after installation");
   const indices = findSwitchboardHookIndices(snapshot.body, entryB64);
@@ -838,16 +865,8 @@ function recordCodexHookTrust({ hooksJsonPath, entryB64, previous, env }) {
   const stateKey = codexHookStateKey(snapshot.identity.requested_path, indices.groupIndex, indices.handlerIndex);
   const trustedHash = codexHookTrustedHash(indices.handler);
   const configPath = codexUserConfigPath(env);
-  let original = "";
-  let mode = 0o600;
-  let existed = false;
-  try {
-    original = readFileSync(configPath, "utf8");
-    mode = statSync(configPath).mode & 0o777;
-    existed = true;
-  } catch (error) {
-    if (error?.code !== "ENOENT") throw error;
-  }
+  const trust = snapshotFile(configPath);
+  const original = decode(trust.body_b64);
   let next = original;
   if (previous?.codex_trust_key && previous.codex_trust_key !== stateKey) {
     next = removeTrustEntry(next, previous.codex_trust_key);
@@ -855,8 +874,11 @@ function recordCodexHookTrust({ hooksJsonPath, entryB64, previous, env }) {
   const alreadyRecorded = readTrustEntry(next, stateKey) === trustedHash;
   if (!alreadyRecorded) next = upsertTrustEntry(next, stateKey, trustedHash);
   if (next !== original) {
-    if (existed) backup(configPath);
-    atomicText(configPath, next, mode);
+    journalPhase(home, state, "trust_recorded", { trust });
+    injectAfterPhase(env, "trust_recorded");
+    if (trust.existed) backup(configPath);
+    atomicText(configPath, next, trust.mode);
+    injectAfterMutation(env, "trust_write");
   }
   return { stateKey, status: alreadyRecorded && next === original ? "already recorded" : "recorded" };
 }
@@ -957,7 +979,7 @@ function installOne({ plan, repository, home, binPath, env, plugin }) {
     injectAfterPhase(env, "credential_written");
 
     const packageRecord = host === "opencode"
-      ? installOpenCodeDependency(project, plugin, env, home, state) : null;
+      ? installOpenCodeDependency(project, plugin, env, home, state, previous) : null;
     journalPhase(home, state, "package_installed", { package_skipped: host !== "opencode" });
     injectAfterPhase(env, "package_installed");
 
@@ -1006,7 +1028,7 @@ function installOne({ plan, repository, home, binPath, env, plugin }) {
     if (host === "codex") {
       try {
         codexTrust = recordCodexHookTrust({
-          hooksJsonPath: paths.config, entryB64: installedEntryB64, previous, env,
+          hooksJsonPath: paths.config, entryB64: installedEntryB64, previous, env, home, state,
         });
       } catch (error) {
         const reason = String(error?.message ?? error).replace(/\.+$/, "").replace(/\s+/g, " ").trim();
@@ -1076,32 +1098,32 @@ function install({ args, repository, home, binPath, env }) {
   for (const host of targets) if (!discovered[host]) throw new Error(`Coding host not found: ${host}`);
   const plugin = resolveOpenCodePlugin(option(args, "--opencode-plugin-tarball"));
 
-  // All target shapes and identities are checked before the first credential, package, or config mutation.
-  const plans = targets.map((host) => {
-    const hadState = existsSync(statePath(home, host));
-    const state = readState(home, host);
-    const projectClaude = host === "claude-code" && Boolean(projectOption) && !global;
-    const paths = hostPaths(host, { project, projectClaude, env });
-    if (!hadState && existsSync(paths.credential)) {
-      throw new Error("host credentials exist without install state; refusing to take ownership");
-    }
-    const scope = scopeId(repository, host, { project, projectClaude });
-    const previous = currentScope(state, scope);
-    if (host === "opencode") readOpenCodePackageJson(project);
-    return {
-      host, project, projectClaude, paths, scope, previous, state,
-      preflight: preflightConfig(host, paths.config, previous, plugin),
-    };
-  });
-  // Recovery is itself a mutation, so it starts only after every requested
-  // config has passed the read-only preflight above.
-  for (const plan of plans) {
-    plan.state = recoverHost(repository, home, plan.host);
-    plan.previous = currentScope(plan.state, plan.scope);
-    if (plan.host === "opencode") readOpenCodePackageJson(project);
-    plan.preflight = preflightConfig(plan.host, plan.paths.config, plan.previous, plugin);
-  }
   const failures = [];
+  const plans = [];
+  for (const host of targets) {
+    try {
+      const hadState = existsSync(statePath(home, host));
+      const state = readState(home, host);
+      const projectClaude = host === "claude-code" && Boolean(projectOption) && !global;
+      const paths = hostPaths(host, { project, projectClaude, env });
+      if (!hadState && existsSync(paths.credential)) {
+        throw new Error("host credentials exist without install state; refusing to take ownership");
+      }
+      const scope = scopeId(repository, host, { project, projectClaude });
+      let previous = currentScope(state, scope);
+      if (host === "opencode") readOpenCodePackageJson(project);
+      let preflight = preflightConfig(host, paths.config, previous, plugin);
+
+      // Recovery is a mutation, but this host passed its own read-only preflight first.
+      const recoveredState = recoverHost(repository, home, host);
+      previous = currentScope(recoveredState, scope);
+      if (host === "opencode") readOpenCodePackageJson(project);
+      preflight = preflightConfig(host, paths.config, previous, plugin);
+      plans.push({ host, project, projectClaude, paths, scope, previous, state: recoveredState, preflight });
+    } catch (error) {
+      failures.push({ host, message: String(error?.message ?? error).replace(/\s+/g, " ").trim() });
+    }
+  }
   for (const plan of plans) {
     try {
       installOne({ plan, repository, home, binPath, env, plugin });
@@ -1245,8 +1267,9 @@ function uninstall({ args, repository, home, env }) {
   }
 
   if (host === "opencode") {
+    const packageSnapshot = readOpenCodePackageJson(scope.project);
     unlinkSync(snapshot.identity.target_path);
-    if (scope.plugin_name) uninstallOpenCodeDependency(scope);
+    if (scope.plugin_name) uninstallOpenCodeDependency(scope, packageSnapshot);
   }
   else {
     casJsonMutation(snapshot, (config) => mergeHookRemoval(config, scope), { env });

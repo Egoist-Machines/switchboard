@@ -73,3 +73,30 @@ test("Codex trust TOML escapes state keys", () => {
   assert.ok(text.includes('[hooks.state."/a/\\"quoted\\"/.codex/hooks.json:user_prompt_submit:0:0"]'));
   assert.equal(readTrustEntry(text, key), "sha256:escaped");
 });
+
+test("Codex trust TOML recognizes inline comments without duplicating a table", () => {
+  const key = "/a/b/.codex/hooks.json:user_prompt_submit:0:0";
+  const header = `[hooks.state."${key}"]`;
+  const original = `${header}\ntrusted_hash = "sha256:old" # Codex recorded this value\n`;
+  assert.equal(readTrustEntry(original, key), "sha256:old");
+
+  const updated = upsertTrustEntry(original, key, "sha256:new");
+  assert.equal(readTrustEntry(updated, key), "sha256:new");
+  assert.equal(updated.split(header).length - 1, 1);
+  assert.match(updated, /trusted_hash = "sha256:new"\n/);
+});
+
+test("Codex trust TOML accepts commented headers and preserves CRLF writes", () => {
+  const key = "/a/b/.codex/hooks.json:user_prompt_submit:0:0";
+  const otherKey = "/a/b/.codex/hooks.json:user_prompt_submit:1:0";
+  const header = `[hooks.state."${key}"]`;
+  const original = `model = "gpt-5"\r\n  ${header} # trust for the hook\r\n  trusted_hash = "sha256:old" # old value\r\n`;
+  assert.equal(readTrustEntry(original, key), "sha256:old");
+
+  const updated = upsertTrustEntry(original, key, "sha256:new");
+  assert.equal(readTrustEntry(updated, key), "sha256:new");
+  assert.equal(updated.split(header).length - 1, 1);
+  const appended = upsertTrustEntry(updated, otherKey, "sha256:other");
+  assert.equal(readTrustEntry(appended, otherKey), "sha256:other");
+  assert.equal((appended.match(/(?<!\r)\n/g) ?? []).length, 0);
+});

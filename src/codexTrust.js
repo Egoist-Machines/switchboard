@@ -63,6 +63,14 @@ function stateHeader(stateKey) {
   return `[hooks.state."${escapeTomlBasicString(stateKey)}"]`;
 }
 
+function escapeRegex(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function newlineOf(text) {
+  return text.includes("\r\n") ? "\r\n" : "\n";
+}
+
 function linesOf(text) {
   const lines = [];
   let offset = 0;
@@ -80,15 +88,16 @@ function linesOf(text) {
 
 function tableBounds(text, stateKey) {
   const lines = linesOf(text);
-  const headerIndex = lines.findIndex((line) => line.content === stateHeader(stateKey));
+  const headerPattern = new RegExp(`^\\s*${escapeRegex(stateHeader(stateKey))}\\s*(?:#.*)?$`);
+  const headerIndex = lines.findIndex((line) => headerPattern.test(line.content));
   if (headerIndex < 0) return null;
   let endIndex = headerIndex + 1;
-  while (endIndex < lines.length && !lines[endIndex].content.startsWith("[")) endIndex += 1;
+  while (endIndex < lines.length && !/^\s*\[/.test(lines[endIndex].content)) endIndex += 1;
   return { lines, headerIndex, endIndex };
 }
 
 function trustedHashValue(line) {
-  const match = /^trusted_hash\s*=\s*"((?:\\.|[^"\\])*)"\s*$/.exec(line);
+  const match = /^\s*trusted_hash\s*=\s*"((?:\\.|[^"\\])*)"\s*(?:#.*)?$/.exec(line);
   if (!match) return null;
   return match[1].replaceAll('\\"', '"').replaceAll("\\\\", "\\");
 }
@@ -106,11 +115,12 @@ export function readTrustEntry(configTomlText, stateKey) {
 export function upsertTrustEntry(configTomlText, stateKey, trustedHash) {
   const bounds = tableBounds(configTomlText, stateKey);
   const line = `trusted_hash = "${trustedHash}"`;
+  const newline = newlineOf(configTomlText);
   if (!bounds) {
     const header = stateHeader(stateKey);
-    if (!configTomlText) return `${header}\n${line}\n`;
-    const separator = configTomlText.endsWith("\n") || configTomlText.endsWith("\r") ? "\n" : "\n\n";
-    return `${configTomlText}${separator}${header}\n${line}\n`;
+    if (!configTomlText) return `${header}${newline}${line}${newline}`;
+    const separator = configTomlText.endsWith("\n") || configTomlText.endsWith("\r") ? newline : `${newline}${newline}`;
+    return `${configTomlText}${separator}${header}${newline}${line}${newline}`;
   }
   for (let index = bounds.headerIndex + 1; index < bounds.endIndex; index += 1) {
     const current = bounds.lines[index];
@@ -119,9 +129,8 @@ export function upsertTrustEntry(configTomlText, stateKey, trustedHash) {
     }
   }
   const header = bounds.lines[bounds.headerIndex];
-  const eol = header.eol || "\n";
-  if (!header.eol) return `${configTomlText}${eol}${line}${eol}`;
-  return configTomlText.slice(0, header.end) + line + eol + configTomlText.slice(header.end);
+  if (!header.eol) return `${configTomlText}${newline}${line}${newline}`;
+  return configTomlText.slice(0, header.end) + line + newline + configTomlText.slice(header.end);
 }
 
 export function removeTrustEntry(configTomlText, stateKey) {
