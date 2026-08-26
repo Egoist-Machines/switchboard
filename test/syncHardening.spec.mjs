@@ -321,7 +321,7 @@ test("cursor reconciliation fails closed when an applied change is missing", asy
   assert.deepEqual(result.failure_detail, { local_cursor: "0", server_cursor: "3" });
   assert.equal(
     syncFailureMessage(result),
-    "Hosted sync cursors have diverged (local 0, server 3). Hosted sync stays paused. Unlink and relink this device to re-bootstrap from the hosted snapshot, or contact support.",
+    "Hosted sync cursors have diverged (local 0, server 3). Hosted sync stays paused and local memories are unaffected. Contact support to reset this device's hosted sync journal.",
   );
 });
 
@@ -459,7 +459,7 @@ test("sync failure messages distinguish transport failures", () => {
   assert.equal(syncFailureMessage({
     status: "cursor_desync",
     failure_detail: { local_cursor: "4", server_cursor: "2" },
-  }), "Hosted sync cursors have diverged (local 4, server 2). Hosted sync stays paused. Unlink and relink this device to re-bootstrap from the hosted snapshot, or contact support.");
+  }), "Hosted sync cursors have diverged (local 4, server 2). Hosted sync stays paused and local memories are unaffected. Contact support to reset this device's hosted sync journal.");
 });
 
 test("content_rejected exposes local item metadata without changing conflict accounting", async (t) => {

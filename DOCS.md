@@ -243,7 +243,7 @@ Uninstall removes only the exact entry recorded for that scope and leaves unrela
 
 ### Import coding memory
 
-**`switchboard coding import`** discovers existing coding-agent guidance and shows every candidate before it saves anything. Each candidate has a source label, category, and global or project scope. The command asks for an individual `y` or `n` decision. `--dry-run` prints the same preview without prompting or saving.
+**`switchboard coding import`** discovers existing coding-agent guidance and shows every candidate before it saves anything. Each candidate has a source label, category, and global or project scope. The command asks for an individual `y` or `n` decision for each importable item. Items refused by the local content screen remain in the preview with the refusal reason, but are skipped without a prompt. `--dry-run` prints the same preview without prompting or saving.
 
 ```text
 switchboard coding import [--project <directory>] [--dry-run]
@@ -402,7 +402,7 @@ The default **Switchboard home** is **`~/.switchboard`**; set **`SWITCHBOARD_HOM
 
 Runtime memory operations run offline: Switchboard sends no memory text, proposal, query, hand-off snapshot, or client secret off the machine. The one exception is `switchboard coding install` for OpenCode, which runs `npm install` and may contact the npm registry to fetch the plugin package; no store content is involved. Memory text and snapshots stay outside events, receipts, status output, and hand-off lists. Client secrets enter machine commands through local standard input, appear once when created, and persist only as salted hashes in the store.
 
-Switchboard does not store recall queries. Events store a keyed project fingerprint instead of the project value. Linked stores keep the hosted owner scope key and their original replica scope key in private database metadata. The local store accepts any content within the 32 KiB limit for each memory or hand-off payload. During sync, the hosted plane additionally runs a sensitive-content screen that terminally rejects secret-shaped content. A rejected item stays local-only and is reported per item in sync output. `switchboard coding import` warns at import time when an item is likely to be refused by that hosted screen.
+Switchboard does not store recall queries. Events store a keyed project fingerprint instead of the project value. Linked stores keep the hosted owner scope key and their original replica scope key in private database metadata. The local content screen rejects full payment-card numbers, private keys, known service secrets, binary content, and oversized content, with a 32 KiB limit for each memory or hand-off payload. During sync, the hosted plane runs a stricter sensitive-content screen and can terminally reject content the local store accepted. A rejected item stays local-only and is reported per item in sync output. `switchboard coding import` surfaces local-screen refusals per item at preview time.
 
 ## Upgrading
 
@@ -491,9 +491,8 @@ acknowledgement. `invalid_response` means the response shape was not recognized.
 `pull_required_loop` means push remained fenced behind repeated pulls.
 `hosted_unavailable` means the hosted plane returned server errors.
 `cursor_desync` means the hosted cursor moved past changes this device never
-recorded. The client fails closed and leaves local memories unaffected. Unlink
-and relink the device to re-bootstrap from the hosted snapshot under a fresh
-device identity, or contact support.
+recorded. The client fails closed and leaves local memories unaffected. Hosted
+sync stays paused until support resets this device's hosted sync journal.
 Network failure, device approval, and client upgrade failures remain
 `network_failure`, `not_approved`, and `upgrade_required`.
 

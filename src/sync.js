@@ -1256,7 +1256,7 @@ export function syncFailureMessage(result) {
   if (result?.status === "cursor_desync") {
     const local = result.failure_detail?.local_cursor ?? "unknown";
     const server = result.failure_detail?.server_cursor ?? "unknown";
-    return `Hosted sync cursors have diverged (local ${local}, server ${server}). Hosted sync stays paused. Unlink and relink this device to re-bootstrap from the hosted snapshot, or contact support.`;
+    return `Hosted sync cursors have diverged (local ${local}, server ${server}). Hosted sync stays paused and local memories are unaffected. Contact support to reset this device's hosted sync journal.`;
   }
   return "Hosted sync is unavailable.";
 }

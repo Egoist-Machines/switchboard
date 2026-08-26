@@ -58,7 +58,18 @@ mkdir -p "$PWD/node_modules/${pluginName}/src" "$PWD/node_modules/transitive-pac
 printf '%s\\n' '{"type":"module"}' > "$PWD/node_modules/${pluginName}/package.json"
 printf '%s\\n' 'export function createLocalTransport() { return { prefetch: async () => ({ status: "results" }) }; }' > "$PWD/node_modules/${pluginName}/src/localTransport.js"
 printf '%s\\n' transitive > "$PWD/node_modules/transitive-package/index.js"
-printf '%s\\n' internal-lock > "$PWD/node_modules/.package-lock.json"
+node -e '
+const fs = require("fs"), p = require("path"), packages = {};
+for (const entry of fs.readdirSync("node_modules")) {
+  if (entry.startsWith(".")) continue;
+  if (entry.startsWith("@")) {
+    for (const child of fs.readdirSync(p.join("node_modules", entry))) {
+      packages["node_modules/" + entry + "/" + child] = {};
+    }
+  } else packages["node_modules/" + entry] = {};
+}
+fs.writeFileSync("node_modules/.package-lock.json", JSON.stringify({ packages }) + "\\n");
+'
 `, { mode: 0o755 });
   chmodSync(target, 0o755);
 }
@@ -161,6 +172,8 @@ test("global OpenCode merges foreign package state and conservative uninstall ke
   writeFileSync(path.join(directory, "auth.json"), authBody);
   writeFileSync(path.join(directory, "package-lock.json"), "owner-lock\n");
   writeFileSync(path.join(directory, "node_modules", "foreign-package", "index.js"), "foreign\n");
+  writeFileSync(path.join(directory, "node_modules", ".package-lock.json"),
+    `${JSON.stringify({ packages: { "node_modules/foreign-package": {} } })}\n`);
   writeFileSync(packageJsonPath, `${JSON.stringify({
     private: true, dependencies: { "foreign-package": "1.0.0" },
   }, null, 2)}\n`);
@@ -247,12 +260,14 @@ test("generated manifest with a later dev dependency keeps owner package artifac
   assert.equal(existsSync(path.join(directory, "node_modules", DEFAULT_OPENCODE_PLUGIN.name)), false);
 });
 
-test("pre-existing node_modules is recorded as foreign and kept on uninstall", (t) => {
+test("pre-existing npm-tracked node_modules is recorded as foreign and kept on uninstall", (t) => {
   const setup = fixture(t, { xdg: true });
   prepare(setup);
   const directory = globalConfigDirectory(setup);
   mkdirSync(path.join(directory, "node_modules", "owner-cache"), { recursive: true });
   writeFileSync(path.join(directory, "node_modules", "owner-cache", "sentinel"), "owner\n");
+  writeFileSync(path.join(directory, "node_modules", ".package-lock.json"),
+    `${JSON.stringify({ packages: { "node_modules/owner-cache": {} } })}\n`);
 
   assert.equal(setup.run(["coding", "install", "--targets", "opencode"]).status, 0);
   assert.equal(stateFor(setup).scopes[0].node_modules_created, false);

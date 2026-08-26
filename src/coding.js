@@ -479,6 +479,55 @@ function replacedOpenCodePlugin(snapshot, plugin, previous) {
   return snapshot.value.dependencies[previousPluginName] === previous.plugin_spec ? previousPluginName : null;
 }
 
+function openCodeNodeModulesInventoryError(entries) {
+  const names = [...new Set(entries)].sort().join(", ") || "node_modules inventory";
+  return new Error(`OpenCode node_modules contains entries npm does not track: ${names}. ` +
+    "Remove them or declare them in this directory's package.json before reinstalling.");
+}
+
+function assertTrackedOpenCodeNodeModules(directory, allowedPackages = []) {
+  const nodeModulesPath = path.join(directory, "node_modules");
+  let topLevel;
+  try {
+    topLevel = readdirSync(nodeModulesPath, { withFileTypes: true });
+  } catch (error) {
+    if (error?.code === "ENOENT") return;
+    throw openCodeNodeModulesInventoryError(["node_modules inventory"]);
+  }
+  if (!topLevel.length) return;
+
+  const inventory = [];
+  for (const item of topLevel) {
+    if (item.name.startsWith(".")) continue;
+    if (!item.name.startsWith("@")) {
+      inventory.push(item.name);
+      continue;
+    }
+    try {
+      for (const child of readdirSync(path.join(nodeModulesPath, item.name))) {
+        inventory.push(`${item.name}/${child}`);
+      }
+    } catch {
+      inventory.push(item.name);
+    }
+  }
+
+  let packages;
+  try {
+    const manifestPath = path.join(nodeModulesPath, ".package-lock.json");
+    if (!lstatSync(manifestPath).isFile()) throw new Error("not a file");
+    packages = JSON.parse(readFileSync(manifestPath, "utf8")).packages;
+    if (!plainObject(packages)) throw new Error("packages must be an object");
+  } catch {
+    throw openCodeNodeModulesInventoryError(inventory);
+  }
+
+  const allowed = new Set(allowedPackages.filter(Boolean));
+  const untracked = inventory.filter((name) =>
+    !allowed.has(name) && !Object.hasOwn(packages, `node_modules/${name}`));
+  if (untracked.length) throw openCodeNodeModulesInventoryError(untracked);
+}
+
 function reconciledOpenCodePackageBody(snapshot, plugin, removedPluginName) {
   if (!snapshot.existed) return managedOpenCodePackageBody(snapshot, plugin.name, plugin.spec);
   const value = structuredClone(snapshot.value);
@@ -514,9 +563,18 @@ function resolveOpenCodePlugin(tarball) {
 function restoreOpenCodeDependency(record) {
   if (!record) return;
   const directory = path.dirname(record.package_json_path);
-  rmSync(openCodePaths(directory, record.plugin_name).package_path, {
-    recursive: true, force: true,
-  });
+  const packagePath = openCodePaths(directory, record.plugin_name).package_path;
+  if (record.previous_package_backup_path) {
+    if (existsSync(record.previous_package_backup_path)) {
+      rmSync(packagePath, { recursive: true, force: true });
+      mkdirSync(path.dirname(packagePath), { recursive: true });
+      renameSync(record.previous_package_backup_path, packagePath);
+    } else if (!existsSync(packagePath)) {
+      throw new Error("previous OpenCode package backup is missing");
+    }
+  } else {
+    rmSync(packagePath, { recursive: true, force: true });
+  }
   if (record.removed_package_backup_path) {
     const removedPackagePath = openCodePaths(directory, record.removed_plugin_name).package_path;
     if (existsSync(record.removed_package_backup_path)) {
@@ -770,6 +828,7 @@ function installOpenCodeDependency(directory, plugin, env, home, state, previous
   const gitignoreCreated = projectInstall && !existsSync(gitignorePath) &&
     (!existsSync(directory) || !snapshot.existed || previous?.gitignore_created);
   const removedPluginName = replacedOpenCodePlugin(snapshot, plugin, previous);
+  assertTrackedOpenCodeNodeModules(directory, [plugin.name, removedPluginName]);
   const installedBody = reconciledOpenCodePackageBody(snapshot, plugin, removedPluginName);
   const record = {
     package_json_path: packageJsonPath,
@@ -787,18 +846,27 @@ function installOpenCodeDependency(directory, plugin, env, home, state, previous
   journalPhase(home, state, "package_json_prepared", { package: record });
   mkdirSync(directory, { recursive: true });
   if (gitignoreCreated) atomicText(gitignorePath, "*\n", 0o644);
-  // The superseded package is parked before the manifest drops it, because
-  // npm prunes an undeclared package during install and would leave nothing
-  // to restore on rollback. The parking spot must sit outside node_modules,
-  // where npm would prune an unrecognized directory as extraneous.
-  const removedPackagePath = removedPluginName
-    ? openCodePaths(directory, removedPluginName).package_path : null;
+  // Existing target and superseded packages are parked before npm runs,
+  // because pruning or a partial install could leave nothing to restore on
+  // rollback. The parking spots must sit outside node_modules, where npm would
+  // prune unrecognized directories as extraneous.
+  const packagesToPark = [];
+  const removedPackagePath = removedPluginName ? openCodePaths(directory, removedPluginName).package_path : null;
   if (removedPackagePath && existsSync(removedPackagePath)) {
     const removedNameDigest = createHash("sha256").update(removedPluginName, "utf8").digest("hex").slice(0, 16);
     record.removed_package_backup_path = backupPath(
       path.join(directory, `.removed-package-${removedNameDigest}`));
+    packagesToPark.push([removedPackagePath, record.removed_package_backup_path]);
+  }
+  if (existsSync(packagePath)) {
+    const previousNameDigest = createHash("sha256").update(plugin.name, "utf8").digest("hex").slice(0, 16);
+    record.previous_package_backup_path = backupPath(
+      path.join(directory, `.previous-package-${previousNameDigest}`));
+    packagesToPark.push([packagePath, record.previous_package_backup_path]);
+  }
+  if (packagesToPark.length) {
     journalPhase(home, state, "package_reconciliation_prepared", { package: record });
-    renameSync(removedPackagePath, record.removed_package_backup_path);
+    for (const [source, parked] of packagesToPark) renameSync(source, parked);
     injectAfterMutation(env, "package_reconciliation");
   }
   if (!snapshot.existed || snapshot.body !== installedBody) {
@@ -869,8 +937,12 @@ function uninstallOpenCodeDependency(scope, directory, snapshot = readOpenCodePa
     if (Array.isArray(value)) return value.some((name) => name !== scope.plugin_name);
     return true;
   });
-  const removeGeneratedTree = scope.package_json_created && scope.node_modules_created === true &&
+  let removeGeneratedTree = scope.package_json_created && scope.node_modules_created === true &&
     !hasForeignDependencies;
+  if (removeGeneratedTree) {
+    try { assertTrackedOpenCodeNodeModules(directory, [scope.plugin_name]); }
+    catch { removeGeneratedTree = false; }
+  }
   if (snapshot.existed && plainObject(snapshot.value.dependencies) &&
       Object.hasOwn(snapshot.value.dependencies, scope.plugin_name)) {
     const managed = switchboardManagedOpenCodePackage(snapshot, scope.plugin_name, scope.plugin_spec);
@@ -933,9 +1005,10 @@ function commitRemediation(home, state, step, error) {
 }
 
 function removeOpenCodePackageBackup(record) {
-  if (!record?.removed_package_backup_path) return;
-  rmSync(record.removed_package_backup_path, { recursive: true, force: true });
-  if (existsSync(record.removed_package_backup_path)) throw new Error("removed OpenCode package backup remains after commit");
+  for (const parked of [record?.removed_package_backup_path, record?.previous_package_backup_path].filter(Boolean)) {
+    rmSync(parked, { recursive: true, force: true });
+    if (existsSync(parked)) throw new Error("OpenCode package backup remains after commit");
+  }
 }
 
 function finalizeTransactionCommit(repository, home, state, env = process.env) {
@@ -1274,13 +1347,21 @@ function install({ args, repository, home, binPath, env }) {
       }
       const scope = scopeId(repository, host, { project, projectClaude, projectOpenCode });
       let previous = currentScope(state, scope);
-      if (host === "opencode") readOpenCodePackageJson(paths.opencode_directory);
+      if (host === "opencode") {
+        const packageSnapshot = readOpenCodePackageJson(paths.opencode_directory);
+        assertTrackedOpenCodeNodeModules(paths.opencode_directory,
+          [plugin.name, replacedOpenCodePlugin(packageSnapshot, plugin, previous)]);
+      }
       let preflight = preflightConfig(host, paths.config, previous, plugin);
 
       // Recovery is a mutation, but this host passed its own read-only preflight first.
       const recoveredState = recoverHost(repository, home, host);
       previous = currentScope(recoveredState, scope);
-      if (host === "opencode") readOpenCodePackageJson(paths.opencode_directory);
+      if (host === "opencode") {
+        const packageSnapshot = readOpenCodePackageJson(paths.opencode_directory);
+        assertTrackedOpenCodeNodeModules(paths.opencode_directory,
+          [plugin.name, replacedOpenCodePlugin(packageSnapshot, plugin, previous)]);
+      }
       preflight = preflightConfig(host, paths.config, previous, plugin);
       plans.push({ host, project, projectClaude, projectOpenCode, paths, scope, previous, state: recoveredState, preflight });
     } catch (error) {

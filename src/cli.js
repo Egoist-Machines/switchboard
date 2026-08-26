@@ -625,7 +625,9 @@ async function main(args = process.argv.slice(2)) {
       "uninstall requires one valid --target",
       "coding requires install, status, doctor, or uninstall",
     ]);
-    const safe = safeMessages.has(error.message) || /^Coding host not found: (opencode|claude-code|codex)$/.test(error.message);
+    const safe = safeMessages.has(error.message) ||
+      /^Coding host not found: (opencode|claude-code|codex)$/.test(error.message) ||
+      /^OpenCode node_modules contains entries npm does not track: .+\. Remove them or declare them in this directory's package\.json before reinstalling\.$/.test(error.message);
     process.stderr.write(`${safe ? error.message : "Command could not be completed."}\n`);
     return 2;
   } finally {

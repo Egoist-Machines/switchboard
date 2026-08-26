@@ -10,6 +10,7 @@ import { createInterface } from "node:readline/promises";
 import Database from "better-sqlite3";
 
 import { resolveProjectIdentity, resolveProjectScope, scopeForRemote } from "./projectIdentity.js";
+import { screenContent } from "./repository.js";
 
 const INSTRUCTION_FILE = /^(?:claude|agents)(?:\.[^.]+)*\.md$|(?:instruction|instructions|rules)(?:\.[^.]+)*\.(?:md|rules)$/i;
 const DISABLED_MEMORY_MODES = new Set(["0", "disabled", "false", "none", "off"]);
@@ -18,17 +19,6 @@ const MAX_IMPORT_CANDIDATES = 100;
 const MAX_VISITED_DIRECTORIES = 100;
 const MAX_PREVIEW_CHARS = 2_000;
 const THREAD_LOOKUP_BATCH = 100;
-
-const HOSTED_CONTENT_SHAPES = [
-  ["a private key", /-----BEGIN (?:[A-Z0-9]+ )?PRIVATE KEY(?: BLOCK)?-----/],
-  ["a provider token", /\b(?:sk-[A-Za-z0-9]{32,}|sk-(?:proj|live|test|svcacct)-[A-Za-z0-9_-]{16,}|sk-ant-(?:api\d{2}-)?[A-Za-z0-9_-]{16,}|sk_(?:live|test)_[A-Za-z0-9]{16,}|AKIA[0-9A-Z]{16}|AIza[A-Za-z0-9_-]{35}|gh[opsu]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{10,})\b/],
-  ["a credential assignment", /(?:api[_-]?(?:key|secret)|client[_-]?secret|access[_-]?token|secret[_-]?key)\s*[:=]\s*["']?[A-Za-z0-9_./+=-]{16,}/i],
-];
-
-export function detectHostedContentShape(content) {
-  if (typeof content !== "string") return null;
-  return HOSTED_CONTENT_SHAPES.find(([, pattern]) => pattern.test(content))?.[0] ?? null;
-}
 
 function fileText(file, notes = null, label = "Import source") {
   let descriptor;
@@ -71,9 +61,9 @@ function saveId(repository, sourceKey, content) {
 
 function entry(repository, { source, sourceKey, content, projectScope = null, note = null, category = null }) {
   const resolvedCategory = category ?? bucket(content, projectScope);
-  const hostedShape = detectHostedContentShape(content);
-  const hostedNote = hostedShape
-    ? `The hosted content screen is likely to refuse this ${source} item (${resolvedCategory}) at sync time because it matches ${hostedShape}; Switchboard will still import it locally.`
+  const contentRefusal = screenContent(content);
+  const refusalNote = contentRefusal
+    ? `The local content screen will refuse this ${source} item (${resolvedCategory}) with reason ${contentRefusal}.`
     : null;
   return {
     source,
@@ -81,7 +71,8 @@ function entry(repository, { source, sourceKey, content, projectScope = null, no
     content,
     project_scope: projectScope,
     category: resolvedCategory,
-    note: [note, hostedNote].filter(Boolean).join(" ") || null,
+    note: [note, refusalNote].filter(Boolean).join(" ") || null,
+    content_refusal: contentRefusal,
     save_id: saveId(repository, sourceKey, content),
   };
 }
@@ -430,6 +421,10 @@ export async function importCodingMemories({
   try {
     for (const [index, item] of discovery.entries.entries()) {
       if (item.already_present) continue;
+      if (item.content_refusal) {
+        skipped += 1;
+        continue;
+      }
       let accepted = false;
       if (confirm) accepted = Boolean(await confirm(item, index));
       else {
