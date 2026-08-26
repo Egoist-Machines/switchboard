@@ -402,7 +402,7 @@ The default **Switchboard home** is **`~/.switchboard`**; set **`SWITCHBOARD_HOM
 
 Runtime memory operations run offline: Switchboard sends no memory text, proposal, query, hand-off snapshot, or client secret off the machine. The one exception is `switchboard coding install` for OpenCode, which runs `npm install` and may contact the npm registry to fetch the plugin package; no store content is involved. Memory text and snapshots stay outside events, receipts, status output, and hand-off lists. Client secrets enter machine commands through local standard input, appear once when created, and persist only as salted hashes in the store.
 
-Switchboard does not store recall queries. Events store a keyed project fingerprint instead of the project value. Linked stores keep the hosted owner scope key and their original replica scope key in private database metadata. Content screening rejects full payment-card numbers, private keys, known service secrets, binary content, and oversized content; each memory or hand-off payload has a 32 KiB limit.
+Switchboard does not store recall queries. Events store a keyed project fingerprint instead of the project value. Linked stores keep the hosted owner scope key and their original replica scope key in private database metadata. The local store accepts any content within the 32 KiB limit for each memory or hand-off payload. During sync, the hosted plane additionally runs a sensitive-content screen that terminally rejects secret-shaped content. A rejected item stays local-only and is reported per item in sync output. `switchboard coding import` warns at import time when an item is likely to be refused by that hosted screen.
 
 ## Upgrading
 
