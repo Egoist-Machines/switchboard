@@ -4,7 +4,7 @@ This page contains the complete command reference and the JSON contract for agen
 
 ## Pairing and grants
 
-Use one client for each coding-agent installation. The supported host values are `codex`, `claude-code`, `opencode`, and `other`. A paired client may propose memory, but it needs an active grant for every category it reads.
+Use one client for each coding-agent installation. The supported host values are `codex`, `claude-code`, `opencode`, `cursor`, and `other`. A paired client may propose memory, but it needs an active grant for every category it reads.
 
 1. Run **`switchboard client add --host <host> --label <label>`**.
 2. Store the printed client ID and client secret.
@@ -185,7 +185,7 @@ Initialize Switchboard before installing a host. **`switchboard coding install`*
 
 ```text
 switchboard init
-switchboard coding install [--targets opencode,claude-code,codex] [--project <directory>] [--global]
+switchboard coding install [--targets opencode,claude-code,codex,cursor] [--project <directory>] [--global]
 ```
 
 The installer pairs one exact client for each host and creates a `coding` grant. It reuses an active client and grant on repeated runs, then prints the client ID, granted categories, verification result, and uninstall command. It attempts every requested host. If one host fails, it prints these lines to standard error, continues with the other requested hosts, and exits with code 1 after the remaining installs finish:
@@ -201,6 +201,8 @@ Claude Code uses **`~/.claude/settings.json`** by default. Use `--project <direc
 codex: hook trust could not be recorded: <reason>. Open codex in this project and trust the hook via /hooks.
 ```
 
+Cursor uses the user-level **`~/.cursor/hooks.json`**. It always uses user scope, including when `--project` is present. Its `sessionStart` hook injects approved memory once per conversation and resolves the project from the session workspace root. Saves continue through the Switchboard CLI. Cursor requires the workspace to be trusted before `cursor-agent` runs at all, through its interactive prompt or the `--trust` or `-f` flags for non-interactive runs. That is a Cursor runtime requirement and is unrelated to the Switchboard install.
+
 OpenCode installs **`@egoistmachines/opencode-switchboard`** in its global config directory by default, **`$XDG_CONFIG_HOME/opencode`** when `XDG_CONFIG_HOME` is set or **`~/.config/opencode`** otherwise. The package dependency and **`plugin/ai-passport.js`** entry at that location load in every project, so the adapter follows the owner between repositories. The entry enables ambient memory and hand-offs, treats the install as the owner-present ceremony, and keeps hosted fallback off. Existing `opencode.json`, `opencode.jsonc`, auth data, and foreign package dependencies stay in place. The installer creates or merges **`package.json`**, creates a timestamped backup before changing a foreign manifest, and runs `npm install` in the global config directory. Use `--global` to request this default explicitly.
 
 Use `--project <directory>` for an isolated install in **`<directory>/.opencode`**. The package root is then **`.opencode/`**, and the managed entry remains **`.opencode/plugin/ai-passport.js`**. When the installer creates `.opencode` or its managed manifest, it also creates **`.opencode/.gitignore`** containing `*` unless that ignore file already exists. This keeps the generated directory out of repository status without replacing project-owned ignore rules. Later npm activity at the project root does not touch the isolated package tree. For development, use a local package archive:
@@ -211,15 +213,16 @@ switchboard coding install --targets opencode --project <directory> --opencode-p
 
 The tarball form reads the plugin name from the archive and records a `file:` dependency with the archive's absolute path in the manifest. Uninstall removes the managed entry, dependency, and installed plugin package. When Switchboard created the manifest and no foreign dependencies remain, it also removes the generated `node_modules` tree, package lock files, its `.gitignore`, and an empty `plugin` directory. A project `.opencode` directory is removed when empty. The global config directory itself is never removed, and user config, auth files, pre-existing manifests, foreign dependencies, and their `node_modules` tree are preserved. Existing project-scoped OpenCode installs are not migrated automatically. After a global install, Switchboard prints an uninstall command for each one that remains.
 
-For Claude Code and Codex, Switchboard appends only its own hook to existing JSON config and keeps unrelated settings and hooks. OpenCode uses its exact managed entry file and refuses to replace a foreign entry. Each host has one paired client shared across that host's installed project or user scopes; versioned per-host state records every scope, installed entry, and config file identity.
+For Claude Code, Codex, and Cursor, Switchboard appends only its own hook to existing JSON config and keeps unrelated settings and hooks. OpenCode uses its exact managed entry file and refuses to replace a foreign entry. Each host has one paired client shared across that host's installed project or user scopes; versioned per-host state records every scope, installed entry, and config file identity.
 
-Changing an existing Claude Code or Codex config creates a timestamped backup beside it. Repeated unchanged runs do not add another hook or backup. Credentials use mode `0600` at these locations:
+Changing an existing Claude Code, Codex, or Cursor config creates a timestamped backup beside it. Repeated unchanged runs do not add another hook or backup. Credentials use mode `0600` at these locations:
 
 - Claude Code: **`~/.local/share/switchboard/claude-code-credentials.json`**
 - Codex: **`~/.local/share/switchboard/codex-credentials.json`**
+- Cursor: **`~/.local/share/switchboard/cursor-credentials.json`**
 - OpenCode: **`switchboard-credentials.json`** in the OpenCode state directory
 
-Use **`switchboard coding status`** to print install state, client ID, active coding categories, config state, and the last verification result for each host. When a host has scopes installed for other projects but not the selected project, status prints `installed=no (N other scopes)`. OpenCode selects its user scope by default and a project scope with `--project`. Old project-only OpenCode state remains visible, verifiable, and removable. Codex normally has one user scope, so `--project` does not change its hook location; legacy project-scoped Codex records still use the selected project for status, doctor, and uninstall. The Codex line also prints `hook_trust=ok`, `hook_trust=missing`, `hook_trust=stale`, or `hook_trust=unknown` for the selected installed scope. Use **`switchboard coding doctor`** to repeat discovery and adapter verification and check credential permissions, store health, and Codex hook trust. Doctor exits with code 1 when Codex trust is missing or stale and prints these remediation lines:
+Use **`switchboard coding status`** to print install state, client ID, active coding categories, config state, and the last verification result for each host. When a host has scopes installed for other projects but not the selected project, status prints `installed=no (N other scopes)`. OpenCode selects its user scope by default and a project scope with `--project`. Old project-only OpenCode state remains visible, verifiable, and removable. Codex and Cursor normally have one user scope, so `--project` does not change their hook locations; legacy project-scoped Codex records still use the selected project for status, doctor, and uninstall. The Codex line also prints `hook_trust=ok`, `hook_trust=missing`, `hook_trust=stale`, or `hook_trust=unknown` for the selected installed scope. Use **`switchboard coding doctor`** to repeat discovery and adapter verification and check credential permissions, store health, and Codex hook trust. Doctor exits with code 1 when Codex trust is missing or stale and prints these remediation lines:
 
 ```text
 remediation: switchboard coding install --targets codex --project .
@@ -272,7 +275,7 @@ The hosted account already stores the owner's memory content. Holding the owner'
 
 Scope-key rotation within one hosted owner is a future compatibility contract. This release does not rotate an owner's key. Relinking through a different account intentionally gives the store a different active owner key, so new project fingerprints diverge from the old account's fingerprints while old rows remain locally readable through the former-key fallback.
 
-Claude Code and Codex prefetch hooks and the OpenCode system transform resolve the current repository before recall. They inject global memory plus memory with that exact project scope. A different project scope never matches. Outside Git they inject global memory only. Project scope is an additional filter and never grants a category or widens an existing pass.
+Claude Code and Codex prefetch hooks, the Cursor prefetch hook, and the OpenCode system transform resolve the current repository before recall. Cursor resolves it from the session workspace root. They inject global memory plus memory with that exact project scope. A different project scope never matches. Outside Git they inject global memory only. Project scope is an additional filter and never grants a category or widens an existing pass.
 
 ### Prefetch and propose
 
@@ -301,6 +304,8 @@ Input must not exceed 131,072 UTF-16 code units. Each command writes one newline
 A malformed request prints `Malformed invocation.` and exits with code 2. An invalid `save_id` prints its exact pattern requirement and exits with code 2. A machine dependency failure prints an error, returns an `unavailable` outcome, and exits with code 0; other domain outcomes also exit with code 0.
 
 Claude Code and Codex ambient hooks use **`switchboard hook claude-prefetch`** and **`switchboard hook codex-prefetch`**. Each reads the host's `UserPromptSubmit` JSON from standard input, reads only that host's credential file, and calls the local store in process. It writes host hook JSON with an `<ai-passport>` reference block when a readable or blocked result needs context; empty results, unavailable stores, malformed input, unsafe credentials, and deadline overruns write nothing and exit with code 0.
+
+Cursor uses **`switchboard hook cursor-prefetch`**. It reads Cursor's `sessionStart` JSON from standard input, including `workspace_roots`, reads only the Cursor credential file, and calls the local store in process. It writes either nothing or one JSON line in the form `{"additional_context": "..."}` and always exits with code 0.
 
 ### Prefetch request and response
 
@@ -413,6 +418,8 @@ The version 8 migration is forward-only, like the earlier schema bumps. Before u
 Other unsupported schema versions fail closed. Keep the pre-upgrade directory copy until the upgraded binary and sync flow have been verified.
 
 Hosted sync negotiates row-shape capabilities before it downloads a page. An older client keeps its hosted cursor when a newer shape appears and receives actionable upgrade guidance.
+
+Pairing a Cursor client writes a `client_paired` event that Switchboard versions before this adapter reject as invalid. Upgrade every synced machine before installing the Cursor adapter.
 
 ## Sync reference
 
@@ -636,3 +643,7 @@ The installer includes the final npm error lines after this prefix. Check the np
 ### Codex hook trust
 
 When `coding status` shows `hook_trust=missing` or `hook_trust=stale`, run **`switchboard coding doctor --project <directory>`**. It exits with code 1 and prints the install command plus `or open codex in this project and trust the hook via /hooks.` Open Codex and use `/hooks` to trust the user-level hook when Switchboard cannot record the trust entry itself.
+
+### Cursor `sessionStart` context
+
+Some Cursor IDE 3.x builds have a known bug where `sessionStart` `additional_context` does not reach the agent. The Cursor CLI injects it correctly. Both use the same user-level **`~/.cursor/hooks.json`** file.
