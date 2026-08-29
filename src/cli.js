@@ -251,7 +251,8 @@ async function main(args = process.argv.slice(2)) {
   }
   const invokedBin = process.argv[1] ? path.resolve(process.argv[1]) : fileURLToPath(import.meta.url);
   if (command === "hook") {
-    const host = args[1] === "claude-prefetch" ? "claude-code" : args[1] === "codex-prefetch" ? "codex" : null;
+    const host = args[1] === "claude-prefetch" ? "claude-code" : args[1] === "codex-prefetch" ? "codex" :
+      args[1] === "cursor-prefetch" ? "cursor" : null;
     return host ? await runPrefetchHook({ host, binPath: invokedBin }) : 0;
   }
   if (command === "coding" && args[1] === "install" && !existsSync(path.join(home, "runtime.json"))) {
@@ -297,7 +298,7 @@ async function main(args = process.argv.slice(2)) {
 
   try {
     if (command === "hook-worker") {
-      const host = ["claude-code", "codex"].includes(args[1]) ? args[1] : null;
+      const host = ["claude-code", "codex", "cursor"].includes(args[1]) ? args[1] : null;
       return host ? await runPrefetchWorker({ host, repository }) : 0;
     }
 
@@ -613,6 +614,10 @@ async function main(args = process.argv.slice(2)) {
       "host config hooks must be an object",
       "UserPromptSubmit entries must contain a hooks array",
       "UserPromptSubmit contains an invalid hook entry",
+      "Cursor hooks version must be 1",
+      "Cursor hooks must be an object",
+      "Cursor sessionStart hooks must be an array",
+      "Cursor sessionStart contains an invalid hook entry",
       "host config symlink must resolve to a regular file",
       "host config must be a regular file",
       "host config identity no longer matches install state",
@@ -626,7 +631,7 @@ async function main(args = process.argv.slice(2)) {
       "coding requires install, status, doctor, or uninstall",
     ]);
     const safe = safeMessages.has(error.message) ||
-      /^Coding host not found: (opencode|claude-code|codex)$/.test(error.message) ||
+      /^Coding host not found: (opencode|claude-code|codex|cursor)$/.test(error.message) ||
       /^OpenCode node_modules contains entries npm does not track: .+\. Remove them or declare them in this directory's package\.json before reinstalling\.$/.test(error.message);
     process.stderr.write(`${safe ? error.message : "Command could not be completed."}\n`);
     return 2;

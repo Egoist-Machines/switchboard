@@ -1,6 +1,6 @@
 # Switchboard
 
-**Switchboard gives OpenCode, Claude Code, Codex, and any Cloud Agent one shared, owner-governed memory.**
+**Switchboard gives OpenCode, Claude Code, Codex, Cursor, and any Cloud Agent one shared, owner-governed memory.**
 
 *Built by [Egoist Machines, Inc.](https://egoistmachines.com/) - efficient full-stack infrastructure for reliable AI systems.*
 
@@ -28,7 +28,7 @@ Switchboard gives every supported editor the same owner-governed store. Memory c
 
 ## Features
 
-- **One memory across editors.** OpenCode, Claude Code, and Codex read from the same local store, subject to each client's grant.
+- **One memory across editors.** OpenCode, Claude Code, Codex, and Cursor read from the same local store, subject to each client's grant.
 - **Owner-governed access.** Pair exact clients, grant only named categories, and revoke a client or grant at any time.
 - **Optional cross-machine sync.** Content-free lifecycle events sync separately from deletable content records, and hosted sync stays off until you link it.
 - **Stable project scope.** Project memories are keyed to Git repository identity, not an absolute checkout path, so worktrees and clones of the same remote share scope.
@@ -61,7 +61,7 @@ The coding installer attempts every supported host it finds. A failure for one h
 switchboard coding install # Install detected editor adapters
 ```
 
-Run the installer with `--targets opencode,claude-code,codex` when you want to select exact hosts. Host-specific scopes, paths, status checks, and uninstall commands are covered in [coding host installation](DOCS.md#install-coding-hosts).
+Run the installer with `--targets opencode,claude-code,codex,cursor` when you want to select exact hosts. Host-specific scopes, paths, status checks, and uninstall commands are covered in [coding host installation](DOCS.md#install-coding-hosts).
 
 OpenCode installs in `$XDG_CONFIG_HOME/opencode` by default, or `~/.config/opencode` when `XDG_CONFIG_HOME` is unset, so the adapter follows the owner into every project. Use `--project <directory>` for an isolated `.opencode` install. Project installs create `.opencode/.gitignore` with `*` only when no ignore file already exists. For an installer-owned manifest with no foreign dependencies, uninstall also removes the generated dependency tree, lock files, managed ignore file, and an empty project `.opencode` directory. It never removes the global config directory or user files inside it.
 

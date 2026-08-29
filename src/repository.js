@@ -829,7 +829,7 @@ export class LocalRepository {
       throw new Error("invalid event payload");
     }
     if (event.op === "client_paired" &&
-      (!["opencode", "claude-code", "codex", "other"].includes(payload.host) || typeof payload.label !== "string" ||
+      (!["opencode", "claude-code", "codex", "cursor", "other"].includes(payload.host) || typeof payload.label !== "string" ||
         !payload.label || payload.label.length > 120 || /[\u0000-\u001f\u007f]/.test(payload.label) ||
         !/^[a-f0-9]{32}$/.test(payload.secret_salt) || !/^[a-f0-9]{64}$/.test(payload.secret_hash))) {
       throw new Error("invalid event payload");
@@ -1487,7 +1487,7 @@ export class LocalRepository {
   addClient({ host, label, clientId = null, eventId = null }) {
     const normalizedHost = typeof host === "string" ? host.trim() : "";
     const normalizedLabel = typeof label === "string" ? label.trim() : "";
-    if (!["opencode", "claude-code", "codex", "other"].includes(normalizedHost)) throw new Error("invalid host");
+    if (!["opencode", "claude-code", "codex", "cursor", "other"].includes(normalizedHost)) throw new Error("invalid host");
     if (!normalizedLabel || normalizedLabel.length > 120 || /[\u0000-\u001f\u007f]/.test(normalizedLabel)) throw new Error("invalid label");
     const pairedClientId = requireUuid(clientId ?? this.uuid(), "client id");
     const pairedEventId = requireUuid(eventId ?? this.uuid(), "client event id");

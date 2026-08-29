@@ -14,8 +14,9 @@ import {
   readTrustEntry, removeTrustEntry, upsertTrustEntry,
 } from "./codexTrust.js";
 import { hostCredentialPath, loadHostCredentials } from "./hook.js";
+import { resolveProjectScopes } from "./projectIdentity.js";
 
-const HOSTS = Object.freeze(["opencode", "claude-code", "codex"]);
+const HOSTS = Object.freeze(["opencode", "claude-code", "codex", "cursor"]);
 const STATE_VERSION = 2;
 const HOOK_TIMEOUT_SECONDS = 2;
 const STATE_REMEDIATION = "Coding install state is missing or invalid; no changes were made. Re-run coding install to repair it.";
@@ -224,6 +225,33 @@ function validateHookConfigBody(body, existed) {
   return value;
 }
 
+function validateCursorHookConfigBody(body, existed) {
+  const value = existed ? JSON.parse(body) : {};
+  if (!plainObject(value)) throw new Error("host config must contain one JSON object");
+  if (Object.hasOwn(value, "version") && value.version !== 1) {
+    throw new Error("Cursor hooks version must be 1");
+  }
+  if (Object.hasOwn(value, "hooks") && !plainObject(value.hooks)) {
+    throw new Error("Cursor hooks must be an object");
+  }
+  const entries = value.hooks?.sessionStart;
+  if (value.hooks && Object.hasOwn(value.hooks, "sessionStart") && !Array.isArray(entries)) {
+    throw new Error("Cursor sessionStart hooks must be an array");
+  }
+  for (const entry of entries ?? []) {
+    if (!plainObject(entry) || typeof entry.command !== "string") {
+      throw new Error("Cursor sessionStart contains an invalid hook entry");
+    }
+  }
+  return value;
+}
+
+function validateHostHookConfigBody(host, body, existed) {
+  return host === "cursor"
+    ? validateCursorHookConfigBody(body, existed)
+    : validateHookConfigBody(body, existed);
+}
+
 function readCurrentLike(snapshot) {
   const current = configSnapshot(snapshot.identity.requested_path);
   if (!sameIdentity(current.identity, snapshot.identity)) throw new Error("host config identity changed during installation");
@@ -235,10 +263,12 @@ function shellQuote(value) {
 }
 
 function hookCommand(binPath, host) {
-  return `${shellQuote(binPath)} hook ${host === "codex" ? "codex-prefetch" : "claude-prefetch"}`;
+  const command = host === "codex" ? "codex-prefetch" : host === "cursor" ? "cursor-prefetch" : "claude-prefetch";
+  return `${shellQuote(binPath)} hook ${command}`;
 }
 
 function hookEntry(binPath, host) {
+  if (host === "cursor") return { command: hookCommand(binPath, host), timeout: HOOK_TIMEOUT_SECONDS };
   return { hooks: [{
     type: "command", command: hookCommand(binPath, host), timeout: HOOK_TIMEOUT_SECONDS,
     statusMessage: "Checking AI Passport memory",
@@ -247,28 +277,59 @@ function hookEntry(binPath, host) {
 
 const entryBytes = (value) => JSON.stringify(value);
 
-function exactEntryIndex(config, entryB64) {
-  return (config.hooks?.UserPromptSubmit ?? []).findIndex((group) => encode(entryBytes(group)) === entryB64);
+function exactEntryIndex(host, config, entryB64) {
+  const entries = host === "cursor" ? config.hooks?.sessionStart ?? [] : config.hooks?.UserPromptSubmit ?? [];
+  return entries.findIndex((entry) => encode(entryBytes(entry)) === entryB64);
 }
 
-function configuredCommand(entryB64) {
+function configuredCommand(host, entryB64) {
   try {
-    const command = JSON.parse(decode(entryB64))?.hooks?.[0]?.command;
+    const value = JSON.parse(decode(entryB64));
+    const command = host === "cursor" ? value?.command : value?.hooks?.[0]?.command;
     return typeof command === "string" ? command : null;
   } catch { return null; }
 }
 
-function mergeHookInstall(config, desired, previous) {
+function hookSuffix(host) {
+  return host === "codex" ? " hook codex-prefetch" : host === "cursor" ? " hook cursor-prefetch" : " hook claude-prefetch";
+}
+
+function mergeCursorHookInstall(config, desired, previous) {
+  const result = structuredClone(config);
+  const hooksExisted = plainObject(result.hooks);
+  const eventExisted = Array.isArray(result.hooks?.sessionStart);
+  const versionExisted = Object.hasOwn(result, "version");
+  if (!Object.hasOwn(result, "version")) result.version = 1;
+  if (!result.hooks) result.hooks = {};
+  if (!result.hooks.sessionStart) result.hooks.sessionStart = [];
+  if (previous) {
+    const oldIndex = exactEntryIndex("cursor", result, previous.entry_b64);
+    if (oldIndex >= 0) result.hooks.sessionStart.splice(oldIndex, 1);
+    else if (result.hooks.sessionStart.some((entry) => entry.command.endsWith(hookSuffix("cursor")))) {
+      throw new Error("recorded hook changed; refusing to replace an unowned entry");
+    }
+  }
+  result.hooks.sessionStart.push(desired);
+  return {
+    value: result,
+    metadata: previous?.metadata ?? {
+      hooks_existed: hooksExisted, event_existed: eventExisted, version_existed: versionExisted,
+    },
+  };
+}
+
+function mergeHookInstall(host, config, desired, previous) {
+  if (host === "cursor") return mergeCursorHookInstall(config, desired, previous);
   const result = structuredClone(config);
   const hooksExisted = plainObject(result.hooks);
   const eventExisted = Array.isArray(result.hooks?.UserPromptSubmit);
   if (!result.hooks) result.hooks = {};
   if (!result.hooks.UserPromptSubmit) result.hooks.UserPromptSubmit = [];
   if (previous) {
-    const oldIndex = exactEntryIndex(result, previous.entry_b64);
+    const oldIndex = exactEntryIndex(host, result, previous.entry_b64);
     if (oldIndex >= 0) result.hooks.UserPromptSubmit.splice(oldIndex, 1);
     else {
-      const suffix = previous.host === "codex" ? " hook codex-prefetch" : " hook claude-prefetch";
+      const suffix = hookSuffix(previous.host);
       const suspicious = result.hooks.UserPromptSubmit.some((group) =>
         group.hooks.some((entry) => entry.type === "command" && entry.command.endsWith(suffix)));
       if (suspicious) throw new Error("recorded hook changed; refusing to replace an unowned entry");
@@ -278,9 +339,19 @@ function mergeHookInstall(config, desired, previous) {
   return { value: result, metadata: previous?.metadata ?? { hooks_existed: hooksExisted, event_existed: eventExisted } };
 }
 
-function mergeHookRemoval(config, scope) {
+function mergeHookRemoval(host, config, scope) {
+  if (host === "cursor") {
+    const result = structuredClone(config);
+    const index = exactEntryIndex(host, result, scope.entry_b64);
+    if (index < 0) throw new Error(STATE_REMEDIATION);
+    result.hooks.sessionStart.splice(index, 1);
+    if (!result.hooks.sessionStart.length && !scope.metadata?.event_existed) delete result.hooks.sessionStart;
+    if (!Object.keys(result.hooks).length && !scope.metadata?.hooks_existed) delete result.hooks;
+    if (!scope.metadata?.version_existed) delete result.version;
+    return result;
+  }
   const result = structuredClone(config);
-  const index = exactEntryIndex(result, scope.entry_b64);
+  const index = exactEntryIndex(host, result, scope.entry_b64);
   if (index < 0) throw new Error(STATE_REMEDIATION);
   result.hooks.UserPromptSubmit.splice(index, 1);
   if (!result.hooks.UserPromptSubmit.length && !scope.metadata?.event_existed) delete result.hooks.UserPromptSubmit;
@@ -288,10 +359,10 @@ function mergeHookRemoval(config, scope) {
   return result;
 }
 
-function casJsonMutation(initial, merge, { env, beforeWrite } = {}) {
+function casJsonMutation(host, initial, merge, { env, beforeWrite } = {}) {
   let snapshot = initial;
   for (let attempt = 0; attempt < 2; attempt += 1) {
-    const config = validateHookConfigBody(snapshot.body, snapshot.existed);
+    const config = validateHostHookConfigBody(host, snapshot.body, snapshot.existed);
     const merged = merge(config);
     const body = `${JSON.stringify(merged.value ?? merged, null, 2)}\n`;
     if (attempt === 0 && env?.SWITCHBOARD_CODING_TEST_CAS_EDIT) {
@@ -329,6 +400,9 @@ function hostPaths(host, { project, projectClaude = false, projectOpenCode = fal
   if (host === "codex") return {
     config: path.join(codexHome(env), "hooks.json"), credential: hostCredentialPath(host, { env, home }),
   };
+  if (host === "cursor") return {
+    config: path.join(home, ".cursor", "hooks.json"), credential: hostCredentialPath(host, { env, home }),
+  };
   const directory = projectOpenCode ? path.join(project, ".opencode") : openCodeGlobalConfigDirectory(env);
   return {
     config: path.join(directory, "plugin", "ai-passport.js"),
@@ -344,6 +418,7 @@ export function discoverCodingHosts({ project = process.cwd(), env = process.env
     codex: executableOnPath("codex", env) || existsSync(codexHome(env)),
     opencode: executableOnPath("opencode", env) || existsSync(hostCredentialPath("opencode", { env, home })) ||
       existsSync(openCodeGlobalConfigDirectory(env)) || existsSync(path.join(project, ".opencode")),
+    cursor: executableOnPath("cursor-agent", env) || existsSync(path.join(home, ".cursor")),
   };
 }
 
@@ -360,7 +435,7 @@ function parseTargets(value) {
 }
 
 function scopeId(repository, host, { project, projectClaude, projectOpenCode = false }) {
-  const userScope = (host === "claude-code" && !projectClaude) || host === "codex" ||
+  const userScope = (host === "claude-code" && !projectClaude) || ["codex", "cursor"].includes(host) ||
     (host === "opencode" && !projectOpenCode);
   const scope = userScope ? "user" : `project:${project}`;
   return repository.scopeFingerprint(`coding-install:${host}:${scope}`);
@@ -794,12 +869,19 @@ function verifyHook({ host, repository, entryB64, env }) {
   let expected;
   try {
     const credentials = loadHostCredentials(host, { env });
-    expected = repository.read({ ...credentials, categories: CODING_PROFILE_CATEGORIES, query: "", ambient: true });
+    expected = repository.read({
+      ...credentials,
+      categories: CODING_PROFILE_CATEGORIES,
+      query: "",
+      ambient: true,
+      project_scopes: resolveProjectScopes(repository, process.cwd()),
+    });
   } catch { return "failed_credentials"; }
-  const command = configuredCommand(entryB64);
+  const command = configuredCommand(host, entryB64);
   if (!command) return "failed_config";
   const child = spawnSync(command, {
-    shell: true, env, input: JSON.stringify({ prompt: "" }), encoding: "utf8",
+    shell: true, env,
+    input: JSON.stringify(host === "cursor" ? { hook_event_name: "sessionStart" } : { prompt: "" }), encoding: "utf8",
     timeout: 2_000, maxBuffer: 64 * 1024,
   });
   if (child.status !== 0 || child.error || child.stderr) return "failed_adapter";
@@ -808,6 +890,10 @@ function verifyHook({ host, repository, entryB64, env }) {
   if (child.stdout.trim()) {
     try {
       const output = JSON.parse(child.stdout);
+      if (host === "cursor") {
+        if (typeof output?.additional_context !== "string") return "failed_adapter";
+        return `passed_${expected.status}`;
+      }
       if (output?.hookSpecificOutput?.hookEventName !== "UserPromptSubmit" ||
         typeof output?.hookSpecificOutput?.additionalContext !== "string") return "failed_adapter";
     } catch { return "failed_adapter"; }
@@ -1006,11 +1092,14 @@ function preflightConfig(host, target, previous, plugin = DEFAULT_OPENCODE_PLUGI
       throw new Error("OpenCode plugin entry already exists and is not managed by Switchboard");
     }
   } else {
-    const config = validateHookConfigBody(snapshot.body, snapshot.existed);
-    if (previous && snapshot.existed && exactEntryIndex(config, previous.entry_b64) < 0) {
-      const suffix = host === "codex" ? " hook codex-prefetch" : " hook claude-prefetch";
-      if ((config.hooks?.UserPromptSubmit ?? []).some((group) =>
-        group.hooks.some((entry) => entry.type === "command" && entry.command.endsWith(suffix)))) {
+    const config = validateHostHookConfigBody(host, snapshot.body, snapshot.existed);
+    if (previous && snapshot.existed && exactEntryIndex(host, config, previous.entry_b64) < 0) {
+      const suffix = hookSuffix(host);
+      const suspicious = host === "cursor"
+        ? (config.hooks?.sessionStart ?? []).some((entry) => entry.command.endsWith(suffix))
+        : (config.hooks?.UserPromptSubmit ?? []).some((group) =>
+          group.hooks.some((entry) => entry.type === "command" && entry.command.endsWith(suffix)));
+      if (suspicious) {
         throw new Error("recorded hook changed; refusing to replace an unowned entry");
       }
     }
@@ -1185,7 +1274,7 @@ function installOne({ plan, repository, home, binPath, env, plugin }) {
     const supersededClientId = !client ? state.client_id : null;
     if (supersededClientId) journalPhase(home, state, "replacement_prepared", { superseded_client_id: supersededClientId });
     if (!client) {
-      const label = `${host === "claude-code" ? "Claude Code" : host === "codex" ? "Codex" : "OpenCode"} coding install`;
+      const label = `${host === "claude-code" ? "Claude Code" : host === "codex" ? "Codex" : host === "cursor" ? "Cursor" : "OpenCode"} coding install`;
       const clientId = randomUUID();
       const clientEventId = randomUUID();
       journalPhase(home, state, "client_create_prepared", {
@@ -1254,11 +1343,12 @@ function installOne({ plan, repository, home, binPath, env, plugin }) {
     } else {
       const desired = hookEntry(binPath, host);
       installedEntryB64 = encode(entryBytes(desired));
-      const currentConfig = validateHookConfigBody(preflight.body, preflight.existed);
+      const currentConfig = validateHostHookConfigBody(host, preflight.body, preflight.existed);
       const alreadyExact = previous?.entry_b64 === installedEntryB64 &&
-        exactEntryIndex(currentConfig, installedEntryB64) >= 0;
+        exactEntryIndex(host, currentConfig, installedEntryB64) >= 0;
       if (!alreadyExact) {
-        casJsonMutation(preflight, (config) => mergeHookInstall(config, desired, previous ? { ...previous, host } : null), {
+        casJsonMutation(host, preflight,
+          (config) => mergeHookInstall(host, config, desired, previous ? { ...previous, host } : null), {
           env,
           beforeWrite(original, body, nextMetadata) {
             state.transaction = { ...state.transaction, config: {
@@ -1270,7 +1360,7 @@ function installOne({ plan, repository, home, binPath, env, plugin }) {
             metadata = nextMetadata;
             installedIdentity = original.identity;
           },
-        });
+          });
       }
     }
     journalPhase(home, state, "config_mutated");
@@ -1366,7 +1456,9 @@ function install({ args, repository, home, binPath, env }) {
     ? ["claude-code", "opencode"].filter((host) => discovered[host])
     : HOSTS.filter((host) => discovered[host]));
   if (!targets.length) throw new Error("No supported coding host was found");
-  if (global && targets.includes("codex")) throw new Error("Only Claude Code and OpenCode support --global");
+  if (global && targets.some((host) => ["codex", "cursor"].includes(host))) {
+    throw new Error("Only Claude Code and OpenCode support --global");
+  }
   const plugin = resolveOpenCodePlugin(option(args, "--opencode-plugin-tarball"));
 
   const failures = [];
@@ -1425,7 +1517,7 @@ function exactConfigPresent(host, scope) {
     const snapshot = configSnapshot(scope.config.requested_path);
     if (!snapshot.existed || !sameIdentity(snapshot.identity, scope.config)) return false;
     if (host === "opencode") return snapshot.body === opencodeEntry(scope.plugin_name ?? LEGACY_OPENCODE_PLUGIN_NAME);
-    return exactEntryIndex(validateHookConfigBody(snapshot.body, true), scope.entry_b64) >= 0;
+    return exactEntryIndex(host, validateHostHookConfigBody(host, snapshot.body, true), scope.entry_b64) >= 0;
   } catch { return false; }
 }
 
@@ -1548,8 +1640,8 @@ function uninstall({ args, repository, home, env }) {
   if (host === "opencode") {
     if (snapshot.body !== opencodeEntry(scope.plugin_name ?? LEGACY_OPENCODE_PLUGIN_NAME)) throw new Error(STATE_REMEDIATION);
   } else {
-    const config = validateHookConfigBody(snapshot.body, true);
-    if (exactEntryIndex(config, scope.entry_b64) < 0) throw new Error(STATE_REMEDIATION);
+    const config = validateHostHookConfigBody(host, snapshot.body, true);
+    if (exactEntryIndex(host, config, scope.entry_b64) < 0) throw new Error(STATE_REMEDIATION);
   }
 
   if (host === "opencode") {
@@ -1560,7 +1652,7 @@ function uninstall({ args, repository, home, env }) {
     else removeEmptyDirectory(path.join(directory, "plugin"));
   }
   else {
-    casJsonMutation(snapshot, (config) => mergeHookRemoval(config, scope), { env });
+    casJsonMutation(host, snapshot, (config) => mergeHookRemoval(host, config, scope), { env });
     if (host === "codex") clearCodexHookTrust(scope, env);
   }
   state.scopes = state.scopes.filter((entry) => entry.scope_id !== scope.scope_id);

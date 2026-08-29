@@ -157,6 +157,7 @@ test("discovery uses PATH stubs and host config directories without external con
     "claude-code": true,
     codex: true,
     opencode: false,
+    cursor: false,
   });
 });
 
