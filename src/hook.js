@@ -100,6 +100,9 @@ export function hostCredentialPath(host, { env = process.env, home = null } = {}
   if (host === "codex") {
     return path.join(ownerHome, ".local", "share", "switchboard", "codex-credentials.json");
   }
+  if (host === "cursor") {
+    return path.join(ownerHome, ".local", "share", "switchboard", "cursor-credentials.json");
+  }
   const explicit = typeof env.OPENCODE_STATE_DIR === "string" ? env.OPENCODE_STATE_DIR.trim() : "";
   const dataHome = typeof env.XDG_DATA_HOME === "string" ? env.XDG_DATA_HOME.trim() : "";
   const state = explicit || path.join(dataHome || path.join(ownerHome, ".local", "share"), "opencode");
@@ -164,18 +167,20 @@ function readHookInput(timeoutMs = HOOK_TIMEOUT_MS) {
 export async function runPrefetchWorker({ host, repository } = {}) {
   try {
     const input = await readHookInput(250);
-    if (typeof input.prompt !== "string") return 0;
+    if (!input || (host !== "cursor" && typeof input.prompt !== "string")) return 0;
     const credentials = loadHostCredentials(host);
+    const cursorProject = Array.isArray(input.workspace_roots) && typeof input.workspace_roots[0] === "string" && input.workspace_roots[0]
+      ? input.workspace_roots[0] : null;
     const projectScopes = resolveProjectScopes(
       repository,
-      typeof input.cwd === "string" && input.cwd ? input.cwd : process.cwd(),
+      cursorProject ?? (typeof input.cwd === "string" && input.cwd ? input.cwd : process.cwd()),
     );
     // Future: keep a persistent, incrementally maintained index so this read is
     // naturally constant-time. The parent deadline remains the safety boundary.
     const outcome = repository.read({
       ...credentials,
       categories: CODING_PROFILE_CATEGORIES,
-      query: input.prompt,
+      query: host === "cursor" ? "" : input.prompt,
       limit: MAX_ROWS,
       ambient: true,
       project_scopes: projectScopes,
@@ -185,12 +190,10 @@ export async function runPrefetchWorker({ host, repository } = {}) {
       recallToolName: host === "codex" ? "passport_recall" : "AI Passport recall",
     });
     if (!block) return 0;
-    process.stdout.write(`${JSON.stringify({
-      hookSpecificOutput: {
-        hookEventName: "UserPromptSubmit",
-        additionalContext: block,
-      },
-    })}\n`);
+    const output = host === "cursor"
+      ? { additional_context: block }
+      : { hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: block } };
+    process.stdout.write(`${JSON.stringify(output)}\n`);
   } catch {}
   return 0;
 }
@@ -198,7 +201,7 @@ export async function runPrefetchWorker({ host, repository } = {}) {
 export async function runPrefetchHook({ host, binPath, timeoutMs = HOOK_TIMEOUT_MS } = {}) {
   const started = performance.now();
   const input = await readHookInput(timeoutMs);
-  if (!input || typeof input.prompt !== "string") return 0;
+  if (!input || (host !== "cursor" && typeof input.prompt !== "string")) return 0;
   const remaining = Math.max(1, timeoutMs - (performance.now() - started));
   return await new Promise((resolve) => {
     let settled = false;
