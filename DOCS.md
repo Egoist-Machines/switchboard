@@ -54,7 +54,7 @@ switchboard version
 **`switchboard init`** creates or opens the store and writes **`runtime.json`**. Repeated calls keep existing state and print this line:
 
 ```text
-Switchboard is ready. Memories saved by paired coding agents are kept automatically in your AI Passport and are readable by clients you grant. Review mode is available through config. Nothing leaves this machine.
+Switchboard is ready. Memories from paired coding agents are saved to the local store and readable only by clients you grant. Review mode is available through config. Nothing leaves this machine.
 ```
 
 ### Show status

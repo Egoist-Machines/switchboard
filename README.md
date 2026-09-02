@@ -1,35 +1,45 @@
 # Switchboard
 
-**Switchboard gives OpenCode, Claude Code, Codex, Cursor, and any Cloud Agent one shared, owner-governed memory.**
+[![CI](https://github.com/Egoist-Machines/switchboard/actions/workflows/test.yml/badge.svg)](https://github.com/Egoist-Machines/switchboard/actions/workflows/test.yml)
+[![npm](https://img.shields.io/npm/v/%40egoistmachines%2Fswitchboard)](https://www.npmjs.com/package/@egoistmachines/switchboard)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+[![Node 22+](https://img.shields.io/badge/node-%3E%3D22-brightgreen)](package.json)
 
-*Built by [Egoist Machines, Inc.](https://egoistmachines.com/) - efficient full-stack infrastructure for reliable AI systems.*
+**One local memory store shared by OpenCode, Claude Code, Codex, and Cursor.** Tell one editor something once, and every editor you have paired and granted access can use it in its next session.
 
-Switchboard is local-first, model-neutral memory for coding agents. It keeps approved preferences, facts, project context, and instructions available when you change models, editors, sessions, or checkouts. Optional hosted sync carries the same governed memory across machines.
+Switchboard runs on your machine. Local use needs no account, sends no telemetry, and makes no network calls. Hosted sync across machines exists, but it is optional and stays off until you link it.
 
-```console
-# OpenCode, session one
-You: Remember that new test files use the .spec.mjs suffix.
-OpenCode: I'll save that to your Passport.
+![Switchboard demo: init, remember twice, recall](https://raw.githubusercontent.com/Egoist-Machines/switchboard/main/docs/demo.gif)
 
-# OpenCode, a fresh session with another model
-You: Add a test for the parser.
-OpenCode: I'll add parser.spec.mjs to match the project's test naming convention.
+*Built by [Egoist Machines, Inc.](https://egoistmachines.com/), efficient full-stack infrastructure for reliable AI systems.*
 
-# Claude Code, a fresh session
-You: What suffix should new test files use?
-Claude Code: Use .spec.mjs for new test files.
+## Try it in 30 seconds
+
+You need Node.js 22 or newer. The first line points Switchboard at a throwaway directory, so the demo memories never reach your real store. As with any `npx` command, npm will populate its own cache.
+
+```bash
+export SWITCHBOARD_HOME=$(mktemp -d)
+npx @egoistmachines/switchboard init
+npx @egoistmachines/switchboard remember "New test files use the .spec.mjs suffix" --category preference
+npx @egoistmachines/switchboard recall
 ```
+
+To keep memories, drop the first line and follow the [quick start](#quick-start) to connect your editors.
 
 ## Why Switchboard
 
-Coding agents usually lose context when a session ends. Claude Code and Codex have their own memory systems, while OpenCode [closed native memory as not planned](https://github.com/anomalyco/opencode/issues/8043). Even when an editor remembers something, that context stays trapped in one tool.
+Coding agents lose context when a session ends. Claude Code and Codex each have a memory system, but what they remember stays inside that one tool. OpenCode [closed native memory as not planned](https://github.com/anomalyco/opencode/issues/8043). Switching models or editors means starting over.
 
-Switchboard gives every supported editor the same owner-governed store. Memory can follow the repository and the person doing the work without turning approval into permanent access or tying context to one checkout path.
+Switchboard gives every supported editor the same store, and you decide what each one can read. Two terms cover most of it:
+
+- **Passport.** Your memory store. It lives in `~/.switchboard` and works with no account. Linking it to [ego.ist](https://ego.ist) is optional and adds sync across your machines.
+- **Grant.** Permission for one paired editor to read named memory categories. The default `coding` grant covers `preference`, `fact`, `project`, and `instruction`. Revoke it at any time.
 
 ## Features
 
 - **One memory across editors.** OpenCode, Claude Code, Codex, and Cursor read from the same local store, subject to each client's grant.
 - **Owner-governed access.** Pair exact clients, grant only named categories, and revoke a client or grant at any time.
+- **Nothing leaves the machine by default.** Runtime memory operations are offline. The one exception is the OpenCode installer, which runs `npm install` to fetch the plugin. See [storage and privacy](DOCS.md#storage-and-privacy).
 - **Optional cross-machine sync.** Content-free lifecycle events sync separately from deletable content records, and hosted sync stays off until you link it.
 - **Stable project scope.** Project memories are keyed to Git repository identity, not an absolute checkout path, so worktrees and clones of the same remote share scope.
 - **Editor hand-offs.** Send a short-lived task snapshot to one exact client or the `coding` profile, then let the next editor claim it once.
@@ -74,7 +84,7 @@ switchboard link                   # Print a link and a match code
 switchboard sync                          # Pull, apply, acknowledge, then push
 ```
 
-The link command prints an approval URL and a six-character match code, and opens the URL in your browser. Sign in to your Passport, check that the code on the page matches your terminal, and approve. The device shows up in your Passport's Devices panel, where you can revoke it at any time. On a machine with no browser, open the printed URL anywhere you are signed in.
+The link command prints an approval URL and a six-character match code. On macOS it also tries to open the URL. Sign in to your Passport, check that the code on the page matches your terminal, and approve. The device shows up in your Passport's Devices panel, where you can revoke it at any time. On a machine with no browser, open the printed URL anywhere you are signed in.
 
 See the [sync reference](DOCS.md#sync-reference) for headless linking, replay, and unlinking. To bring in existing editor memory, start with the [import preview](DOCS.md#import-coding-memory).
 
@@ -88,6 +98,10 @@ See the [sync reference](DOCS.md#sync-reference) for headless linking, replay, a
 
 4. **Sync moves governed state.** When hosted sync is linked, Switchboard pulls before it pushes and ships content-free lifecycle events. Approved memory and pending proposal text travel only as separately deletable content records; hand-offs remain local.
 
+## Open source and the hosted service
+
+The CLI, the editor adapters, and the OpenCode plugin in this repository are Apache 2.0. Everything in the local workflow, from pairing to recall to hand-offs, works without an account. Egoist Machines runs the hosted sync plane at [ego.ist](https://ego.ist), which is where the company makes money. Nothing in the local workflow depends on it, and unlinking a machine leaves the local store intact.
+
 ## Learn more
 
 - [Pairing and grants](DOCS.md#pairing-and-grants)
@@ -97,6 +111,8 @@ See the [sync reference](DOCS.md#sync-reference) for headless linking, replay, a
 - [Project identity and scoped injection](DOCS.md#project-identity-and-scoped-injection)
 - [Storage and privacy](DOCS.md#storage-and-privacy)
 - [Hosted sync](DOCS.md#sync-reference)
+- [Changelog](CHANGELOG.md)
+- [Security policy](SECURITY.md)
 - [OpenCode plugin package](packages/opencode-switchboard/README.md)
 - [Contributing](CONTRIBUTING.md)
 - [Apache License 2.0](LICENSE)

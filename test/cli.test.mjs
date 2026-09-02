@@ -79,8 +79,10 @@ test("init is idempotent and creates private store and discovery files", (t) => 
 
   assert.equal(first.status, 0, first.stderr);
   assert.equal(second.status, 0, second.stderr);
-  assert.match(first.stdout, /kept automatically/);
-  assert.match(first.stdout, /Nothing leaves this machine/);
+  assert.equal(
+    first.stdout,
+    "Switchboard is ready. Memories from paired coding agents are saved to the local store and readable only by clients you grant. Review mode is available through config. Nothing leaves this machine.\n"
+  );
   assert.deepEqual(secondMetadata, firstMetadata);
   assert.deepEqual({ ...firstRecord, bin: undefined }, { version: packageJson.version, home, transport: "cli", bin: undefined });
   assert.equal(path.isAbsolute(firstRecord.bin), true);

@@ -309,7 +309,7 @@ async function main(args = process.argv.slice(2)) {
     if (command === "init") {
       writeDiscovery(home);
       process.stdout.write(
-        "Switchboard is ready. Memories saved by paired coding agents are kept automatically in your AI Passport and are readable by clients you grant. " +
+        "Switchboard is ready. Memories from paired coding agents are saved to the local store and readable only by clients you grant. " +
         "Review mode is available through config. Nothing leaves this machine.\n"
       );
       return 0;
