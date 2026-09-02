@@ -426,7 +426,7 @@ Pairing a Cursor client writes a `client_paired` event that Switchboard versions
 Hosted sync is optional and runs through the owner's AI Passport account.
 
 ```bash
-switchboard link                      # Links to https://passport.ego.ist
+switchboard link                      # Uses the hosted sync API at https://passport.ego.ist
 switchboard link https://example.dev  # Optional override for development or a self-hosted plane
 ```
 

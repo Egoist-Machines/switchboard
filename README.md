@@ -15,16 +15,17 @@ Switchboard runs on your machine. Local use needs no account, sends no telemetry
 
 ## Try it in 30 seconds
 
-You need Node.js 22 or newer. The first line points Switchboard at a throwaway directory, so the demo memories never reach your real store. As with any `npx` command, npm will populate its own cache.
+You need Node.js 22 or newer. The second line points Switchboard at a throwaway directory, so the demo memories never reach your real store. Drop it to keep what you save.
 
 ```bash
+npm install --global @egoistmachines/switchboard
 export SWITCHBOARD_HOME=$(mktemp -d)
-npx @egoistmachines/switchboard init
-npx @egoistmachines/switchboard remember "New test files use the .spec.mjs suffix" --category preference
-npx @egoistmachines/switchboard recall
+switchboard init
+switchboard remember "New test files use the .spec.mjs suffix" --category preference
+switchboard recall
 ```
 
-To keep memories, drop the first line and follow the [quick start](#quick-start) to connect your editors.
+Once the CLI is installed, the [quick start](#quick-start) connects your editors.
 
 ## Why Switchboard
 
@@ -47,23 +48,15 @@ Switchboard gives every supported editor the same store, and you decide what eac
 
 ## Quick start
 
-### 1. Install the CLI
+### 1. Initialize the store
 
-Switchboard requires Node.js 22 or newer. Install the package globally so each editor can reach the same command.
-
-```bash
-npm install --global @egoistmachines/switchboard # Install the CLI
-```
-
-### 2. Initialize the store
-
-Create or open the private local store before installing an editor adapter.
+Install the CLI globally as shown above so each editor can reach the same command, then create or open the private local store before installing an editor adapter.
 
 ```bash
 switchboard init # Create the local store
 ```
 
-### 3. Connect your editors
+### 2. Connect your editors
 
 The coding installer attempts every supported host it finds. A failure for one host does not prevent the other detected editors from installing. Each successful install pairs one exact client, creates its frozen `coding` grant for `preference`, `fact`, `project`, and `instruction`, stores private credentials, and verifies the adapter against the local store.
 
@@ -75,7 +68,7 @@ Run the installer with `--targets opencode,claude-code,codex,cursor` when you wa
 
 OpenCode installs in `$XDG_CONFIG_HOME/opencode` by default, or `~/.config/opencode` when `XDG_CONFIG_HOME` is unset, so the adapter follows the owner into every project. Use `--project <directory>` for an isolated `.opencode` install. Project installs create `.opencode/.gitignore` with `*` only when no ignore file already exists. For an installer-owned manifest with no foreign dependencies, uninstall also removes the generated dependency tree, lock files, managed ignore file, and an empty project `.opencode` directory. It never removes the global config directory or user files inside it.
 
-### 4. Link sync, if you want it
+### 3. Link sync, if you want it
 
 Hosted sync across machines runs through [AI Passport](https://ego.ist), the hosted memory plane behind Switchboard. Create your Passport at [ego.ist](https://ego.ist), then link each machine to it.
 
