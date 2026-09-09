@@ -24,7 +24,7 @@ const DEFAULT_OPENCODE_PLUGIN = Object.freeze({
   name: "@egoistmachines/opencode-switchboard",
   // The spec is the dependency value written into .opencode/package.json,
   // so it must be a plain pinned version, not a name@version specifier.
-  spec: "0.1.2",
+  spec: "0.1.3",
 });
 const LEGACY_OPENCODE_PLUGIN_NAME = "opencode-ai-passport";
 const NPM_PACKAGE_NAME = /^(@[a-z0-9-~][a-z0-9-._~]*\/)?[a-z0-9-~][a-z0-9-._~]*$/;
@@ -100,6 +100,9 @@ function readState(home, host, { required = false } = {}) {
     if (!plainObject(value) || value.version !== STATE_VERSION || value.host !== host ||
       !(value.client_id === null || typeof value.client_id === "string") ||
       !Array.isArray(value.scopes) || !value.scopes.every(validScope) ||
+      (value.channel !== undefined && (!plainObject(value.channel) || !plainObject(value.channel.entry) ||
+        !plainObject(value.channel.identity) || typeof value.channel.identity.requested_path !== "string" ||
+        typeof value.channel.identity.target_path !== "string" || !["file", "symlink"].includes(value.channel.identity.topology))) ||
       !(value.transaction === null || plainObject(value.transaction))) throw new Error("invalid state");
     return value;
   } catch {
@@ -768,10 +771,10 @@ function revokeTransactionRecords(repository, transaction) {
 
 function compensationRemediation(home, state, step, error) {
   const transaction = state.transaction;
-  if (step === "config") {
-    const record = transaction.config;
+  if (step === "config" || step === "channel") {
+    const record = transaction[step];
     const action = record?.original_existed
-      ? `restore ${record.identity.target_path} to the base64-decoded bytes in transaction.config.original_body_b64`
+      ? `restore ${record.identity.target_path} to the base64-decoded bytes in transaction.${step}.original_body_b64`
       : `remove the Switchboard-created file ${record?.identity?.target_path}`;
     return `${action} recorded in ${statePath(home, state.host)}, then run switchboard coding doctor`;
   }
@@ -816,6 +819,7 @@ function rollbackTransaction(repository, home, state, env = process.env) {
   writeState(home, state);
 
   const steps = [];
+  if (transaction.channel?.installed_body_b64) steps.push(["channel", () => restoreConfig(transaction.channel)]);
   if (transaction.config?.installed_body_b64) steps.push(["config", () => restoreConfig(transaction.config)]);
   if (transaction.trust) steps.push(["trust", () => restoreCodexTrust(transaction.trust)]);
   if (transaction.package) steps.push(["package_restore", () => restoreOpenCodeDependency(transaction.package)]);
@@ -880,7 +884,7 @@ function verifyHook({ host, repository, entryB64, env }) {
   const command = configuredCommand(host, entryB64);
   if (!command) return "failed_config";
   const child = spawnSync(command, {
-    shell: true, env,
+    shell: true, env: { ...env, SWITCHBOARD_HOOK_DIAGNOSTIC: "1" },
     input: JSON.stringify(host === "cursor" ? { hook_event_name: "sessionStart" } : { prompt: "" }), encoding: "utf8",
     timeout: 2_000, maxBuffer: 64 * 1024,
   });
@@ -1140,6 +1144,29 @@ function removeOpenCodePackageBackup(record) {
 function finalizeTransactionCommit(repository, home, state, env = process.env) {
   const transaction = state.transaction;
   if (!transaction?.commit) return true;
+  if (transaction.commit.kind === "claude_uninstall") {
+    try {
+      const commit = transaction.commit;
+      if (!commit.keep_client) {
+        try { unlinkSync(commit.credential_path); }
+        catch (error) { if (error.code !== "ENOENT") throw error; }
+        revokeClientAndGrants(repository, state.client_id);
+      }
+      const next = { ...state, scopes: state.scopes.filter(scope => scope.scope_id !== commit.scope_id), transaction: null };
+      delete next.channel;
+      if (!commit.keep_client) next.client_id = null;
+      writeState(home, next);
+      Object.assign(state, next);
+      delete state.channel;
+      return true;
+    } catch (error) {
+      transaction.phase = "commit_needs_attention";
+      transaction.recovery = { status: "needs_attention", failures: [{ step: "uninstall", error: error.message,
+        remediation: `resolve ${error.message}, then run switchboard coding doctor to finish uninstall` }] };
+      writeState(home, state);
+      return false;
+    }
+  }
   const completed = new Set(transaction.recovery?.completed ?? []);
   transaction.phase = "committing";
   transaction.recovery = { status: "committing", completed: [...completed], failures: [] };
@@ -1260,9 +1287,87 @@ function codexHookTrustStatus(scope, env) {
   return recordedHash === trustedHash ? "ok" : "stale";
 }
 
+function claudeChannelConfig(home, binPath) {
+  return { type: "stdio", command: process.execPath, args: [binPath, "channel", "claude"], env: { SWITCHBOARD_HOME: home } };
+}
+
+function checkClaudeChannel(snapshot, previous, { required = false } = {}) {
+  const config = snapshot.existed ? JSON.parse(snapshot.body) : {};
+  if (!plainObject(config) || (config.mcpServers !== undefined && !plainObject(config.mcpServers))) throw new Error("invalid Claude MCP config");
+  const current = config.mcpServers?.switchboard;
+  if (required && (current === undefined || !previous)) throw new Error("Claude switchboard MCP entry is missing");
+  if (previous && !sameIdentity(snapshot.identity, previous.identity)) throw new Error("Claude MCP config identity changed");
+  if (current !== undefined && (!previous || JSON.stringify(current) !== JSON.stringify(previous.entry))) throw new Error("Claude switchboard MCP entry is not installer-owned");
+  return config;
+}
+
+function installClaudeChannel({ home, binPath, env, state }) {
+  const snapshot = configSnapshot(path.join(ownerHome(env), ".claude.json"));
+  checkClaudeChannel(snapshot, state.channel);
+  const entry = claudeChannelConfig(home, binPath);
+  const result = casJsonMutation("claude-code", snapshot, config => {
+    if (config.mcpServers !== undefined && !plainObject(config.mcpServers)) throw new Error("invalid Claude MCP config");
+    const current = config.mcpServers?.switchboard;
+    if (current !== undefined && (!state.channel || JSON.stringify(current) !== JSON.stringify(state.channel.entry))) throw new Error("Claude switchboard MCP entry changed");
+    return { ...config, mcpServers: { ...config.mcpServers, switchboard: entry } };
+  }, { env, beforeWrite(original, body) {
+    state.transaction.channel = {
+      identity: original.identity, original_existed: original.existed,
+      original_body_b64: encode(original.body), original_mode: original.mode,
+      installed_body_b64: encode(body),
+    };
+    writeState(home, state);
+  } });
+  return { identity: result.original.identity, entry };
+}
+
+function removeClaudeChannel(channel, env, beforeWrite) {
+  if (!channel) return;
+  const snapshot = configSnapshot(channel.identity.requested_path);
+  checkClaudeChannel(snapshot, channel, { required: true });
+  casJsonMutation("claude-code", snapshot, config => {
+    if (JSON.stringify(config.mcpServers?.switchboard) !== JSON.stringify(channel.entry)) throw new Error("Claude switchboard MCP entry changed");
+    const mcpServers = { ...config.mcpServers };
+    delete mcpServers.switchboard;
+    const next = { ...config, mcpServers };
+    if (!Object.keys(mcpServers).length) delete next.mcpServers;
+    return next;
+  }, { env, beforeWrite });
+}
+
+function uninstallClaudeChannelScope({ repository, home, state, snapshot, scope, keepClient, env }) {
+  journalPhase(home, state, "uninstall_prepared", { operation: "uninstall" });
+  const recordRemoval = step => (original, body) => {
+    journalPhase(home, state, `uninstall_${step}_prepared`, { [step]: {
+      identity: original.identity, original_existed: original.existed,
+      original_body_b64: encode(original.body), original_mode: original.mode,
+      installed_body_b64: encode(body),
+    } });
+    injectAfterPhase(env, `uninstall_${step}_prepared`);
+  };
+  try {
+    casJsonMutation("claude-code", snapshot, config => mergeHookRemoval("claude-code", config, scope), {
+      env, beforeWrite: recordRemoval("config"),
+    });
+    injectAfterMutation(env, "uninstall_hook_write");
+    removeClaudeChannel(state.channel, env, recordRemoval("channel"));
+    injectAfterMutation(env, "uninstall_channel_write");
+    journalPhase(home, state, "uninstall_commit_prepared", { commit: {
+      kind: "claude_uninstall", scope_id: scope.scope_id, keep_client: keepClient,
+      credential_path: hostCredentialPath("claude-code", { env, home: ownerHome(env) }),
+    } });
+    injectAfterPhase(env, "uninstall_commit_prepared");
+    if (!finalizeTransactionCommit(repository, home, state, env)) throw recoveryError(state);
+  } catch (error) {
+    if (!state.transaction?.commit && !rollbackTransaction(repository, home, state, env)) throw recoveryError(state);
+    throw error;
+  }
+}
+
 function installOne({ plan, repository, home, binPath, env, plugin }) {
   const { host, project, projectOpenCode, paths, scope, previous, preflight } = plan;
   const state = plan.state;
+  if (host === "claude-code") checkClaudeChannel(configSnapshot(path.join(ownerHome(env), ".claude.json")), state.channel);
   const credential = snapshotFile(paths.credential);
   state.transaction = {
     operation: "install", phase: "started", scope_id: scope,
@@ -1363,6 +1468,7 @@ function installOne({ plan, repository, home, binPath, env, plugin }) {
           });
       }
     }
+    const channel = host === "claude-code" ? installClaudeChannel({ home, binPath, env, state }) : null;
     journalPhase(home, state, "config_mutated");
     let codexTrust = null;
     if (host === "codex") {
@@ -1407,6 +1513,7 @@ function installOne({ plan, repository, home, binPath, env, plugin }) {
     else committedScopes.push(row);
     state.scopes = committedScopes;
     state.client_id = client.client_id;
+    if (channel) state.channel = channel;
     state.transaction = { ...state.transaction, phase: "commit_prepared", commit: {
       old_client_id: supersededClientId,
       new_client_id: client.client_id,
@@ -1431,6 +1538,8 @@ function installOne({ plan, repository, home, binPath, env, plugin }) {
     if (host === "opencode") {
       process.stdout.write("OpenCode ambient memory and hand-offs are enabled. This install is the owner-present ceremony. Hosted fallback is disabled.\n");
     }
+    if (host === "claude-code") process.stdout.write("Claude Code channel installed. During research preview start: claude --dangerously-load-development-channels server:switchboard\n");
+    if (["codex", "cursor"].includes(host)) process.stdout.write("Messages arrive at the next prompt. Send with: switchboard message-send --json < request.json (client_id, client_secret, to, body, idempotency_key, optional reply_to). Discover peers with switchboard message-agents --json.\n");
     process.stdout.write(`verification: ${verification}\n`);
     const projectUninstall = (host === "claude-code" && plan.projectClaude) ||
       (host === "opencode" && projectOpenCode);
@@ -1617,6 +1726,15 @@ function doctor({ args, repository, home, env }) {
   return healthy ? 0 : 1;
 }
 
+function reportUninstall(host, state, keepClient) {
+  const last = state.scopes.length === 0;
+  process.stdout.write(`${host}: uninstalled\n`);
+  process.stdout.write(`remaining scopes: ${state.scopes.length}\n`);
+  process.stdout.write(`client: ${last ? (keepClient ? "kept" : "revoked") : "kept (still in use)"}\n`);
+  process.stdout.write("Deleting local memories is a separate owner action.\n");
+  return 0;
+}
+
 function uninstall({ args, repository, home, env }) {
   const host = option(args, "--target");
   if (!HOSTS.includes(host)) throw new Error("uninstall requires one valid --target");
@@ -1625,14 +1743,20 @@ function uninstall({ args, repository, home, env }) {
   const projectClaude = host === "claude-code" && Boolean(projectOption) && !args.includes("--global");
   const projectOpenCode = host === "opencode" && Boolean(projectOption) && !args.includes("--global");
   const state = readState(home, host, { required: true });
+  const pendingCommit = state.transaction?.commit;
+  const resumingUninstall = pendingCommit?.kind === "claude_uninstall" &&
+    selectedScope(state, repository, host, { project, projectClaude, projectOpenCode })?.scope_id === pendingCommit.scope_id;
   if (state.transaction) {
     const recovered = state.transaction.commit
       ? finalizeTransactionCommit(repository, home, state, env)
       : rollbackTransaction(repository, home, state, env);
     if (!recovered) throw recoveryError(state);
   }
+  if (resumingUninstall) return reportUninstall(host, state, pendingCommit.keep_client);
   const scope = selectedScope(state, repository, host, { project, projectClaude, projectOpenCode });
   if (!scope) throw new Error(STATE_REMEDIATION);
+
+  if (host === "claude-code" && state.scopes.length === 1 && state.channel) checkClaudeChannel(configSnapshot(state.channel.identity.requested_path), state.channel, { required: true });
 
   // Resolve and validate everything before making the first change. State and config must agree exactly.
   const snapshot = configSnapshot(scope.config.requested_path);
@@ -1644,7 +1768,11 @@ function uninstall({ args, repository, home, env }) {
     if (exactEntryIndex(host, config, scope.entry_b64) < 0) throw new Error(STATE_REMEDIATION);
   }
 
-  if (host === "opencode") {
+  const keepClient = args.includes("--keep-client");
+  const removeChannel = host === "claude-code" && state.scopes.length === 1 && state.channel;
+  if (removeChannel) {
+    uninstallClaudeChannelScope({ repository, home, state, snapshot, scope, keepClient, env });
+  } else if (host === "opencode") {
     const directory = openCodeScopeDirectory(scope);
     const packageSnapshot = readOpenCodePackageJson(directory);
     unlinkSync(snapshot.identity.target_path);
@@ -1657,19 +1785,14 @@ function uninstall({ args, repository, home, env }) {
   }
   state.scopes = state.scopes.filter((entry) => entry.scope_id !== scope.scope_id);
   const last = state.scopes.length === 0;
-  const keepClient = args.includes("--keep-client");
-  if (last && !keepClient) {
+  if (last && !keepClient && !removeChannel) {
     try { unlinkSync(hostCredentialPath(host, { env, home: ownerHome(env) })); }
     catch (error) { if (error?.code !== "ENOENT") throw error; }
     revokeClientAndGrants(repository, state.client_id);
     state.client_id = null;
   }
   writeState(home, state);
-  process.stdout.write(`${host}: uninstalled\n`);
-  process.stdout.write(`remaining scopes: ${state.scopes.length}\n`);
-  process.stdout.write(`client: ${last ? (keepClient ? "kept" : "revoked") : "kept (still in use)"}\n`);
-  process.stdout.write("Deleting local memories is a separate owner action.\n");
-  return 0;
+  return reportUninstall(host, state, keepClient);
 }
 
 export function runCodingCommand({ args, repository, home, binPath, env = process.env } = {}) {

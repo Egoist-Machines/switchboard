@@ -12,6 +12,12 @@ if (request.fixture_behavior === "require_secret" && request.client_secret !== "
   process.stdout.write("not json\n");
 } else if (request.fixture_behavior === "nonzero") {
   process.exitCode = 7;
+} else if (process.argv[2] === "message-propose") {
+  process.stdout.write(JSON.stringify({ id: "proposal-1", state: "pending", kind: request.kind, purpose: request.purpose, duration_hours: request.duration_hours, sender: request.client_id }));
+} else if (process.argv[2] === "message-proposal-status") {
+  process.stdout.write(JSON.stringify({ id: request.proposal_id, state: "approved" }));
+} else if (process.argv[2] === "message-send") {
+  process.stdout.write(JSON.stringify({ message_id: "message-1", state: "held", proposal_id: "proposal-1" }));
 } else if (process.argv[2] === "propose") {
   process.stdout.write(
     `${JSON.stringify({

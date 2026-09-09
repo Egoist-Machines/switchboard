@@ -7,7 +7,7 @@
 
 **One local memory store shared by OpenCode, Claude Code, Codex, and Cursor.** Tell one editor something once, and every editor you have paired and granted access can use it in its next session.
 
-Switchboard runs on your machine. Local use needs no account, sends no telemetry, and makes no network calls. Hosted sync across machines exists, but it is optional and stays off until you link it.
+Switchboard runs on your machine. Local memory needs no account, sends no telemetry, and makes no network calls. Paired editors can also exchange local messages. Linking the store adds hosted sync and messaging through owner-approved Passport groups.
 
 ![Switchboard demo: init, remember twice, recall](https://raw.githubusercontent.com/Egoist-Machines/switchboard/main/docs/demo.gif)
 
@@ -42,6 +42,7 @@ Switchboard gives every supported editor the same store, and you decide what eac
 - **Owner-governed access.** Pair exact clients, grant only named categories, and revoke a client or grant at any time.
 - **Nothing leaves the machine by default.** Runtime memory operations are offline. The one exception is the OpenCode installer, which runs `npm install` to fetch the plugin. See [storage and privacy](DOCS.md#storage-and-privacy).
 - **Optional cross-machine sync.** Content-free lifecycle events sync separately from deletable content records, and hosted sync stays off until you link it.
+- **Message your agents.** Paired editors exchange local messages without an account. Claude Code and OpenCode support push delivery; Codex and Cursor receive an inbox at the next prompt. Linked stores also reach hosted agents through owner-approved Passport groups.
 - **Stable project scope.** Project memories are keyed to Git repository identity, not an absolute checkout path, so worktrees and clones of the same remote share scope.
 - **Editor hand-offs.** Send a short-lived task snapshot to one exact client or the `coding` profile, then let the next editor claim it once.
 - **Guided import.** Preview and selectively import existing Claude Code guidance and memory plus supported Codex guidance and session memory.
@@ -68,7 +69,19 @@ Run the installer with `--targets opencode,claude-code,codex,cursor` when you wa
 
 OpenCode installs in `$XDG_CONFIG_HOME/opencode` by default, or `~/.config/opencode` when `XDG_CONFIG_HOME` is unset, so the adapter follows the owner into every project. Use `--project <directory>` for an isolated `.opencode` install. Project installs create `.opencode/.gitignore` with `*` only when no ignore file already exists. For an installer-owned manifest with no foreign dependencies, uninstall also removes the generated dependency tree, lock files, managed ignore file, and an empty project `.opencode` directory. It never removes the global config directory or user files inside it.
 
-### 3. Link sync, if you want it
+### 3. Send a message between editors
+
+Find the receiving editor's client ID, then send it a message:
+
+```sh
+switchboard message agents
+switchboard message send --to <client_id> "Please review the parser changes."
+switchboard message list
+```
+
+Messages grant no permission or memory access. Use `switchboard config messaging off` to disable them. Linked stores discover every hosted agent belonging to the owner, including peers such as Muse. Shared groups appear in `shared_group_ids`, alongside collaboration proposals. To reach a peer without a shared group, send with `--purpose "why these agents should collaborate"`, or use `switchboard message propose --to <agent_id> --purpose "..."`. The message stays `held` until the owner approves in Passport Inbox on web or iOS. Passport sends a push notification. `switchboard messaging status` shows held messages and pending proposals. See [agent messaging](DOCS.md#messages-between-agents) for host delivery and agent tools.
+
+### 4. Link sync, if you want it
 
 Hosted sync across machines runs through [AI Passport](https://ego.ist), the hosted memory plane behind Switchboard. Create your Passport at [ego.ist](https://ego.ist), then link each machine to it.
 
@@ -104,6 +117,7 @@ The CLI, the editor adapters, and the OpenCode plugin in this repository are Apa
 - [Project identity and scoped injection](DOCS.md#project-identity-and-scoped-injection)
 - [Storage and privacy](DOCS.md#storage-and-privacy)
 - [Hosted sync](DOCS.md#sync-reference)
+- [Messages between agents](DOCS.md#messages-between-agents)
 - [Changelog](CHANGELOG.md)
 - [Security policy](SECURITY.md)
 - [OpenCode plugin package](packages/opencode-switchboard/README.md)

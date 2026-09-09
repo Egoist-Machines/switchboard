@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { CODING_PROFILE_CATEGORIES } from "./constants.js";
+import { hookMessages } from "./messaging.js";
 import { resolveProjectScopes } from "./projectIdentity.js";
 
 const WRAPPER_OPEN = "<ai-passport>";
@@ -185,15 +186,20 @@ export async function runPrefetchWorker({ host, repository } = {}) {
       ambient: true,
       project_scopes: projectScopes,
     });
-    const block = formatHookMemoryBlock({
+    const memoryBlock = formatHookMemoryBlock({
       outcome,
       recallToolName: host === "codex" ? "passport_recall" : "AI Passport recall",
     });
+    const inbox = process.env.SWITCHBOARD_HOOK_DIAGNOSTIC === "1"
+      ? { block: "", messages: [] }
+      : hookMessages(repository, credentials, MAX_CHARS - (memoryBlock?.length ?? 0) - 1);
+    const block = [memoryBlock, inbox.block].filter(Boolean).join("\n");
     if (!block) return 0;
     const output = host === "cursor"
       ? { additional_context: block }
       : { hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: block } };
-    process.stdout.write(`${JSON.stringify(output)}\n`);
+    await new Promise((resolve, reject) => process.stdout.write(`${JSON.stringify(output)}\n`, error => error ? reject(error) : resolve()));
+    for (const message of inbox.messages) repository.ackMessage({ ...credentials, message_id: message.message_id });
   } catch {}
   return 0;
 }

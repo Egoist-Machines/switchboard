@@ -14,6 +14,10 @@ import { syncFailureMessage, syncOnce } from "./sync.js";
 import { LocalRepository } from "./repository.js";
 import { resolveProjectIdentity, resolveProjectScope, resolveProjectScopes } from "./projectIdentity.js";
 import { resolveSwitchboardHome } from "./storage.js";
+import { randomUUID } from "node:crypto";
+import { receiveMessages } from "./messaging.js";
+import { MessagingRelay, messageAgents, messagingStatus, refreshMessagingStatus, sendMessage, proposeCollaboration, proposalStatus, ensureMessagingRelay } from "./messagingRelay.js";
+import { runClaudeChannel } from "./claudeChannel.js";
 
 const packageJson = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
 
@@ -119,9 +123,10 @@ function writeDiscovery(home) {
 
 function printUsage() {
   process.stdout.write(`Usage: switchboard <command>\n\n` +
-    "Commands: init, status, remember, recall, inbox, client, grant, profile, config, memory, handoff, link, unlink, sync [--replay-from <seq>], doctor, coding, hook, prefetch, propose, handoff-create, handoff-claim\n" +
+    "Commands: init, status, remember, recall, inbox, client, grant, profile, config, memory, handoff, link, unlink, sync [--replay-from <seq>], doctor, coding, hook, prefetch, propose, handoff-create, handoff-claim, message, message-send, message-receive, message-ack, message-agents, message-propose, message-proposal-status, messaging, channel\n" +
     "Version: switchboard --version, switchboard -v, switchboard version\n" +
-    "Coding: switchboard coding import [--project <path>] [--dry-run]\n");
+    "Coding: switchboard coding import [--project <path>] [--dry-run]\n" +
+    "Messaging: switchboard message send --to <id> [--purpose <text>] <text>; switchboard message propose --to <id>[,<id>] --purpose <text> [--name N] [--duration-hours H]; switchboard messaging status|relay; switchboard config messaging on|off\n");
 }
 
 function humanRows(rows) {
@@ -131,6 +136,7 @@ function humanRows(rows) {
 }
 
 function unavailableOutcome(command, saveId = "") {
+  if (command.startsWith("message-")) return { status: "unavailable" };
   if (command === "prefetch") {
     return {
       status: "unavailable",
@@ -155,6 +161,24 @@ async function runMachine(command, repository, preparedInput = null) {
   let input = preparedInput;
   try {
     input ??= await readJsonInput();
+    if (command.startsWith("message-")) {
+      let result;
+      if (command === "message-send") result = await sendMessage(repository, input);
+      else if (command === "message-propose") result = await proposeCollaboration(repository, input);
+      else if (command === "message-proposal-status") result = await proposalStatus(repository, input);
+      else if (command === "message-receive") {
+        repository.requireMessagingClient(input);
+        ensureMessagingRelay(repository);
+        if (input.max_chars != null && (!Number.isInteger(input.max_chars) || input.max_chars < 0 || input.max_chars > 32000)) throw new Error("invalid max_chars");
+        result = await receiveMessages(repository, input, { maxChars: input.max_chars });
+      }
+      else if (command === "message-relay-start") { repository.requireMessagingClient(input); ensureMessagingRelay(repository); result = { status: "ok" }; }
+      else if (command === "message-ack") result = repository.ackMessage(input);
+      else if (command === "message-release") result = repository.releaseMessage(input);
+      else result = await messageAgents(repository, input);
+      writeJson(result);
+      return 0;
+    }
     if (command === "prefetch") {
       rejectWireProjectScope(input);
       if (typeof input.client_id !== "string" || typeof input.client_secret !== "string") throw new Error("client credentials required");
@@ -206,6 +230,11 @@ async function runMachine(command, repository, preparedInput = null) {
     }
     throw new Error("unknown machine command");
   } catch (error) {
+    if (command.startsWith("message-")) {
+      const known = /^(purpose_required|proposal_not_found|proposal_limit|agent_required|messaging_disabled|message_content_refused|message_not_found|message_not_received|idempotency_conflict|messaging_unlinked_or_disabled)$/;
+      writeJson({ status: "error", error: known.test(error.message) ? error.message : /authentication/.test(error.message) ? "unauthorized" : /invalid|ambiguous/.test(error.message) ? "invalid_request" : "unavailable" });
+      return 0;
+    }
     if (error instanceof SyntaxError || /required|must be|invalid|handoff|target client|project|authentication failed|input too large|unknown machine|save_id must match/.test(error.message)) {
       process.stderr.write(error.message.startsWith("save_id must match") ? `${error.message}\n` : "Malformed invocation.\n");
       return 2;
@@ -259,7 +288,7 @@ async function main(args = process.argv.slice(2)) {
     process.stderr.write("Run switchboard init first\n");
     return 2;
   }
-  const machineCommand = ["prefetch", "propose", "handoff-create", "handoff-claim"].includes(command) && has(args, "--json");
+  const machineCommand = ["prefetch", "propose", "handoff-create", "handoff-claim", "message-send", "message-propose", "message-proposal-status", "message-receive", "message-ack", "message-agents", "message-release", "message-relay-start"].includes(command) && has(args, "--json");
   let machineInput = null;
   if (machineCommand) {
     try {
@@ -297,6 +326,49 @@ async function main(args = process.argv.slice(2)) {
   }
 
   try {
+    if (command === "channel") {
+      if (args[1] !== "claude") throw new Error("channel requires claude");
+      return await runClaudeChannel({ repository });
+    }
+    if (command === "messaging") {
+      if (args[1] === "status") writeJson(await refreshMessagingStatus(repository));
+      else if (args[1] === "relay") {
+        const controller = new AbortController();
+        const stop = () => controller.abort();
+        process.once("SIGTERM", stop); process.once("SIGINT", stop);
+        let outcome;
+        try { outcome = await new MessagingRelay(repository, { signal: controller.signal }).run(); }
+        finally { process.off("SIGTERM", stop); process.off("SIGINT", stop); }
+        // A blocked start needs the owner's attention; do not exit quietly with success.
+        if (outcome?.status === "blocked") { writeJson(outcome); return 2; }
+        if (outcome?.status === "already_running") process.stdout.write("relay already running\n");
+      } else throw new Error("messaging requires status or relay");
+      return 0;
+    }
+    if (command === "message") {
+      if (args[1] === "list") writeJson(repository.listMessages());
+      else if (args[1] === "agents") writeJson(await messageAgents(repository));
+      else if (args[1] === "propose") {
+        writeJson(await proposeCollaboration(repository, {
+          client_id: option(args, "--from"),
+          to: option(args, "--to"), kind: option(args, "--kind"), purpose: option(args, "--purpose"),
+          name: option(args, "--name"), project_boundary: option(args, "--project-boundary"),
+          duration_hours: option(args, "--duration-hours") == null ? undefined : Number(option(args, "--duration-hours")),
+          group_id: option(args, "--group-id"), conversation_id: option(args, "--conversation-id"),
+        }, { owner: true }));
+      }
+      else if (args[1] === "proposal-status") writeJson(await proposalStatus(repository, { proposal_id: args[2] }, { owner: true }));
+      else if (args[1] === "send") {
+        const positional = [];
+        for (let i = 2; i < args.length; i++) {
+          if (["--to", "--reply-to", "--purpose", "--name", "--duration-hours"].includes(args[i])) { i++; continue; }
+          positional.push(args[i]);
+        }
+        if (positional.length !== 1) throw new Error("message send requires text");
+        writeJson(await sendMessage(repository, { to: option(args, "--to"), reply_to: option(args, "--reply-to"), purpose: option(args, "--purpose"), name: option(args, "--name"), duration_hours: option(args, "--duration-hours") == null ? undefined : Number(option(args, "--duration-hours")), body: positional[0], idempotency_key: randomUUID() }, { owner: true }));
+      } else throw new Error("message requires send, propose, proposal-status, list, or agents");
+      return 0;
+    }
     if (command === "hook-worker") {
       const host = ["claude-code", "codex", "cursor"].includes(args[1]) ? args[1] : null;
       return host ? await runPrefetchWorker({ host, repository }) : 0;
@@ -316,9 +388,11 @@ async function main(args = process.argv.slice(2)) {
     }
 
     if (command === "status") {
-      const status = repository.status();
+      const status = { ...repository.status(), messaging: messagingStatus(repository) };
       if (has(args, "--json")) writeJson(status);
       else {
+        const messaging = messagingStatus(repository);
+        process.stdout.write(`messaging: ${messaging.enabled ? "on" : "off"}, ${messaging.pending} pending, relay ${messaging.relay}, ${messaging.link}\n`);
         process.stdout.write(`schema: ${status.schema_version}\npolicy: ${status.policy_mode}\nstore: ${status.store}\n`);
         for (const category of MEMORY_CATEGORIES) process.stdout.write(`${category}: ${status.memory_counts[category] ?? 0}\n`);
         process.stdout.write(`clients: ${status.clients.length}\n`);
@@ -406,7 +480,10 @@ async function main(args = process.argv.slice(2)) {
 
     if (command === "config") {
       const action = args[1];
-      if (action === "get") {
+      if (action === "messaging" && ["on", "off"].includes(args[2])) {
+        repository.setMessaging(args[2] === "on");
+        process.stdout.write(`messaging ${args[2]}\n`);
+      } else if (action === "get") {
         process.stdout.write(`auto_approve ${repository.metadata().auto_approve ? "on" : "off"}\n`);
       } else if (action === "set" && args[2] === "auto_approve" && ["on", "off"].includes(args[3])) {
         repository.setAutoApprove(args[3] === "on");
@@ -497,6 +574,7 @@ async function main(args = process.argv.slice(2)) {
     }
 
     if (command === "sync") {
+      ensureMessagingRelay(repository);
       const replayValue = option(args, "--replay-from");
       let replayFrom = null;
       if (has(args, "--replay-from")) {
@@ -575,6 +653,18 @@ async function main(args = process.argv.slice(2)) {
 
     throw new Error("unknown command");
   } catch (error) {
+    if (["message", "messaging", "channel"].includes(command)) {
+      if (error.message === "purpose_required") {
+        process.stderr.write('purpose_required: Pass --purpose "why these agents should collaborate". The owner must approve in Passport Inbox.\n');
+        return 2;
+      }
+      const safe = [
+        "Cannot determine a local member of this group; pass --from <client_id> to select the sending installation",
+        "--from must name an active local client_id",
+      ].includes(error.message) || /^(?:invalid |message |messaging |channel |ambiguous hosted label: )[a-zA-Z0-9 ,:_-]+$/.test(error.message) || /^(?:messaging_[a-z_]+|message_[a-z_]+|channel_already_running|authentication failed)$/.test(error.message);
+      process.stderr.write(`${safe ? error.message : "Messaging is unavailable."}\n`);
+      return 2;
+    }
     const safeMessages = new Set([
       "link requires a base URL",
       "replay sequence must be a positive integer within the assigned range",

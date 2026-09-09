@@ -8,5 +8,6 @@ export const AIPassportPlugin = async (input, options = {}) =>
   (await createPassportHooks({
     rawConfig: options,
     tool,
+    client: input?.client,
     project: typeof input?.directory === "string" ? input.directory : null,
   })).hooks;

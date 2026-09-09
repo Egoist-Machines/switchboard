@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.0 (2026-09-09)
+
+- Add local messages between paired clients: screened bodies in the existing content store, atomic inbox claims, acknowledgement, expiry, and content-free receipts. Messaging is on by default and can be switched off with `switchboard config messaging off`.
+- Deliver into every coding host: a Claude Code channel MCP server installed by `coding install`, OpenCode push through the plugin, and a next-prompt inbox for Codex and Cursor through the existing hook. One untrusted-peer envelope everywhere.
+- Reuse the approved Passport device link for hosted messaging: registration of paired clients as device agents, peer discovery, a singleton relay with SSE reconciliation, custody acknowledgements, and an idempotent outbox.
+- Discover every hosted agent of the owner and propose collaborations, renewals, or continuations from the CLI, the Claude channel, and the OpenCode tools. A send to a peer without a shared group carries a purpose and stays `held` until the owner approves in the Passport Inbox on web or iOS, with a push notification.
+- Migrate the store forward to schema 11 while preserving messages, bodies, events, and hosted receipts. Back up `~/.switchboard` before upgrading.
+- Bump the OpenCode plugin to 0.1.3.
+
 ## 0.2.3 (2026-09-02)
 
 - Included the Cursor adapter in the published npm package. It landed in the repository after 0.2.2 shipped.

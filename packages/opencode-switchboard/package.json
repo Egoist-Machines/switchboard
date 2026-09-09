@@ -5,7 +5,7 @@
     "url": "git+https://github.com/Egoist-Machines/switchboard.git",
     "directory": "packages/opencode-switchboard"
   },
-  "version": "0.1.2",
+  "version": "0.1.3",
   "type": "module",
   "description": "Local-first AI Passport memory for OpenCode.",
   "license": "Apache-2.0",
@@ -35,7 +35,7 @@
     "README.md"
   ],
   "scripts": {
-    "test": "node --test \"test/*.test.mjs\""
+    "test": "node --test \"test/*.test.mjs\" \"test/*.spec.mjs\""
   },
   "dependencies": {
     "@opencode-ai/plugin": "1.18.22"
