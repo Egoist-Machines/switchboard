@@ -14,6 +14,7 @@ import { syncFailureMessage, syncOnce } from "./sync.js";
 import { LocalRepository } from "./repository.js";
 import { resolveProjectIdentity, resolveProjectScope, resolveProjectScopes } from "./projectIdentity.js";
 import { resolveSwitchboardHome } from "./storage.js";
+import { runMessagingCommand } from "./hostedMessaging.js";
 
 const packageJson = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
 
@@ -119,9 +120,10 @@ function writeDiscovery(home) {
 
 function printUsage() {
   process.stdout.write(`Usage: switchboard <command>\n\n` +
-    "Commands: init, status, remember, recall, inbox, client, grant, profile, config, memory, handoff, link, unlink, sync [--replay-from <seq>], doctor, coding, hook, prefetch, propose, handoff-create, handoff-claim\n" +
+    "Commands: init, status, remember, recall, inbox, client, grant, profile, config, memory, handoff, link, unlink, sync [--replay-from <seq>], doctor, coding, hook, prefetch, propose, handoff-create, handoff-claim, messaging\n" +
     "Version: switchboard --version, switchboard -v, switchboard version\n" +
-    "Coding: switchboard coding import [--project <path>] [--dry-run]\n");
+    "Coding: switchboard coding import [--project <path>] [--dry-run]\n" +
+    "Messaging: switchboard messaging --help (separate optional Passport package and consent)\n");
 }
 
 function humanRows(rows) {
@@ -218,6 +220,7 @@ async function runMachine(command, repository, preparedInput = null) {
 
 async function main(args = process.argv.slice(2)) {
   const command = args[0];
+  if (command === "messaging") return runMessagingCommand(args.slice(1));
   if (["--version", "-v", "version"].includes(command)) {
     process.stdout.write(`${packageJson.version}\n`);
     return 0;

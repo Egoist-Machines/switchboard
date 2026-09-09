@@ -2698,7 +2698,7 @@ test("replay validates the assigned range and lets the server settle locally del
   repository.close();
 });
 
-test("review proposals sync as pending while hand-off events and content stay local", async (t) => {
+test("review proposals sync as pending while hand-off and message events and content stay local", async (t) => {
   const repository = new LocalRepository({ home: temporaryHome(t), initializeDefaults: false });
   await bootstrap(repository);
   const client = repository.addClient({ host: "codex", label: "Custody test" });
@@ -2715,6 +2715,11 @@ test("review proposals sync as pending while hand-off events and content stay lo
     client_secret: client.client_secret,
     snapshot: "HANDOFF_CONTENT_MUST_STAY_LOCAL",
     to_client_id: client.client_id,
+  });
+  repository.sendMessage({
+    client_id: client.client_id, client_secret: client.client_secret,
+    to: client.client_id, body: "MESSAGE_CONTENT_MUST_STAY_LOCAL",
+    idempotency_key: "58000000-0000-4000-8000-000000000001",
   });
   let uploadBody;
   const fetchImpl = scriptedFetch((call) => {
@@ -2735,6 +2740,7 @@ test("review proposals sync as pending while hand-off events and content stay lo
   assert.deepEqual(uploadBody.events.map((event) => event.op), ["proposal_created"]);
   assert.equal(uploadBody.content_records[0].content, "PENDING_PROPOSAL_CONTENT");
   assert.equal(JSON.stringify(uploadBody).includes("HANDOFF_CONTENT_MUST_STAY_LOCAL"), false);
+  assert.equal(JSON.stringify(uploadBody).includes("MESSAGE_CONTENT_MUST_STAY_LOCAL"), false);
   assert.equal(JSON.stringify(result).includes("PENDING_PROPOSAL_CONTENT"), false);
   repository.close();
 });

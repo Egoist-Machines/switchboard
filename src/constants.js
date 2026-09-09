@@ -24,7 +24,7 @@ export const CODING_PROFILE_CATEGORIES = Object.freeze([
 export const SYNC_CAPABILITIES = Object.freeze(["null_tombstones"]);
 export const SYNC_CAPABILITIES_HEADER = "x-switchboard-capabilities";
 
-export const SCHEMA_VERSION = 8;
+export const SCHEMA_VERSION = 10;
 export const EVENT_FORMAT_VERSION = 1;
 export const MAX_CONTENT_BYTES = 32 * 1024;
 export const DEFAULT_HANDOFF_TTL_MS = 24 * 60 * 60 * 1000;

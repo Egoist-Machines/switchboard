@@ -58,6 +58,9 @@ const EVENT_PAYLOAD_KEYS = Object.freeze({
   handoff_created: ["content_ref", "expires_at", "profile", "project_scope", "to_client_id"],
   handoff_claimed: ["project_scope"],
   handoff_expired: [],
+  message_created: [],
+  message_delivered: [],
+  message_expired: [],
 });
 
 function existingSchemaVersion(db) {
@@ -75,7 +78,7 @@ export function unsupportedSchemaVersionMessage(version, expectedVersion = SCHEM
 
 function assertSchemaCompatible(db) {
   const version = existingSchemaVersion(db);
-  if (version !== null && !["4", "5", "6", "7", String(SCHEMA_VERSION)].includes(version)) {
+  if (version !== null && !["4", "5", "6", "7", "8", "9", String(SCHEMA_VERSION)].includes(version)) {
     throw new Error(unsupportedSchemaVersionMessage(version));
   }
   return version;
@@ -104,7 +107,7 @@ function migrateV4ToV5(db) {
             'proposal_created', 'proposal_approved', 'proposal_rejected', 'memory_deleted',
             'grant_created', 'grant_revoked', 'client_paired', 'client_revoked',
             'profile_defined', 'profile_versioned', 'handoff_created',
-            'handoff_claimed', 'handoff_expired'
+            'handoff_claimed', 'handoff_expired', 'message_created', 'message_delivered', 'message_expired'
           )),
           actor TEXT NOT NULL CHECK (actor IN ('owner', 'client')),
           client_id TEXT,
@@ -123,6 +126,50 @@ function migrateV4ToV5(db) {
   }
   const violations = db.pragma("foreign_key_check");
   if (violations.length) throw new Error("Switchboard v4 migration failed foreign-key verification");
+}
+
+function migrateV9ToV10(db) {
+  db.transaction(() => {
+    const sql = db.prepare("SELECT sql FROM sqlite_master WHERE name = 'messages'").get().sql;
+    const columns = db.pragma("table_info(messages)").map(column => column.name);
+    db.exec("ALTER TABLE messages RENAME TO messages_v9");
+    db.exec(sql.replace("hosted_message_id TEXT UNIQUE", "hosted_message_id TEXT, hosted_receipt_id TEXT"));
+    const values = columns.map(column => column === "hosted_message_id"
+      ? "CASE WHEN origin = 'hosted' THEN hosted_message_id END" : column);
+    db.exec(`INSERT INTO messages (${columns.join(",")}, hosted_receipt_id)
+      SELECT ${values.join(",")}, CASE WHEN origin = 'local' THEN hosted_message_id END FROM messages_v9;
+      DROP TABLE messages_v9;
+      UPDATE meta SET value = '10' WHERE key = 'schema_version';`);
+  }).immediate();
+}
+
+function messageMetadata(row) {
+  const { request_hash, claim_pid, ...metadata } = row;
+  return metadata;
+}
+
+function migrateMessaging(db) {
+  const version = existingSchemaVersion(db);
+  if (version === null || version === String(SCHEMA_VERSION)) return;
+  const foreignKeys = db.pragma("foreign_keys", { simple: true });
+  db.pragma("foreign_keys = OFF");
+  db.pragma("legacy_alter_table = ON");
+  try {
+    db.transaction(() => {
+      // Rebuild the CHECK constraint without changing event ids or referencing tables.
+      const sql = db.prepare("SELECT sql FROM sqlite_master WHERE name = 'events'").get().sql;
+      db.exec("DROP TRIGGER IF EXISTS events_forbid_update; DROP TRIGGER IF EXISTS events_forbid_delete;");
+      db.exec("ALTER TABLE events RENAME TO events_before_messages");
+      db.exec(sql.includes("'message_created'") ? sql : sql.replace("'handoff_expired'", "'handoff_expired', 'message_created', 'message_delivered', 'message_expired'"));
+      db.exec("INSERT INTO events SELECT * FROM events_before_messages; DROP TABLE events_before_messages;");
+      schema(db);
+      db.prepare("UPDATE meta SET value = ? WHERE key = 'schema_version'").run(String(SCHEMA_VERSION));
+    }).immediate();
+  } finally {
+    db.pragma("legacy_alter_table = OFF");
+    db.pragma(`foreign_keys = ${foreignKeys ? "ON" : "OFF"}`);
+  }
+  if (db.pragma("foreign_key_check").length) throw new Error("messaging migration foreign-key verification failed");
 }
 
 function schema(db) {
@@ -161,7 +208,7 @@ function schema(db) {
         'proposal_created', 'proposal_approved', 'proposal_rejected', 'memory_deleted',
         'grant_created', 'grant_revoked', 'client_paired', 'client_revoked',
         'profile_defined', 'profile_versioned', 'handoff_created',
-        'handoff_claimed', 'handoff_expired'
+        'handoff_claimed', 'handoff_expired', 'message_created', 'message_delivered', 'message_expired'
       )),
       actor TEXT NOT NULL CHECK (actor IN ('owner', 'client')),
       client_id TEXT,
@@ -258,6 +305,47 @@ function schema(db) {
       categories TEXT NOT NULL,
       row_count INTEGER NOT NULL CHECK (row_count >= 0),
       created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS messages (
+      message_id TEXT PRIMARY KEY,
+      conversation_id TEXT NOT NULL,
+      reply_to TEXT,
+      from_kind TEXT NOT NULL CHECK (from_kind IN ('client','hosted','owner')),
+      from_ref TEXT,
+      from_label TEXT,
+      to_kind TEXT NOT NULL CHECK (to_kind IN ('client','hosted')),
+      to_ref TEXT NOT NULL,
+      content_version INTEGER NOT NULL DEFAULT 1,
+      state TEXT NOT NULL CHECK (state IN ('pending','notified','delivered','expired')),
+      origin TEXT NOT NULL CHECK (origin IN ('local','hosted')),
+      hosted_message_id TEXT,
+      hosted_receipt_id TEXT,
+      hosted_group_id TEXT,
+      hosted_conversation_id TEXT,
+      hosted_sender_id TEXT,
+      link_key TEXT,
+      idempotency_key TEXT NOT NULL,
+      request_hash TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      delivered_at TEXT,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      retry_at TEXT,
+      last_error TEXT,
+      claim_pid INTEGER,
+      UNIQUE(from_kind, from_ref, idempotency_key)
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS messages_owner_idempotency ON messages(idempotency_key) WHERE from_kind = 'owner';
+    CREATE UNIQUE INDEX IF NOT EXISTS messages_hosted_inbound ON messages(hosted_message_id) WHERE origin = 'hosted';
+    CREATE INDEX IF NOT EXISTS messages_hosted_receipt ON messages(hosted_receipt_id);
+    CREATE INDEX IF NOT EXISTS messages_inbox ON messages(to_ref, state, created_at, message_id);
+    CREATE INDEX IF NOT EXISTS messages_expiry ON messages(state, expires_at);
+    CREATE TABLE IF NOT EXISTS messaging_agents (
+      client_id TEXT PRIMARY KEY REFERENCES clients(client_id),
+      agent_id TEXT NOT NULL,
+      link_key TEXT NOT NULL,
+      label TEXT NOT NULL,
+      runtime TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS handoffs (
       handoff_id TEXT PRIMARY KEY,
@@ -482,10 +570,12 @@ export class LocalRepository {
     try {
       const version = assertSchemaCompatible(this.db);
       if (version === "4") migrateV4ToV5(this.db);
+      if (version === "9") migrateV9ToV10(this.db);
       schema(this.db);
       if (version === "4" || version === "5") this.#migrateV5ToV6();
       if (["4", "5", "6"].includes(version)) this.#migrateV6ToV7();
       if (["4", "5", "6", "7"].includes(version)) this.#migrateV7ToV8();
+      migrateMessaging(this.db);
       this.#initialize();
     } catch (error) {
       this.db.close();
@@ -493,6 +583,7 @@ export class LocalRepository {
     }
     this.recallIndex = new RecallIndex({ loadRows: () => this.#approvedRows() });
     this.expireHandoffs();
+    this.expireMessages();
   }
 
   #initialize() {
@@ -678,7 +769,7 @@ export class LocalRepository {
       if (!/^[a-f0-9]{64}$/.test(legacyKey ?? "")) throw new Error("invalid project scope key");
       this.db.prepare("INSERT OR IGNORE INTO meta(key, value) VALUES ('replica_scope_key', ?)").run(legacyKey);
       this.db.prepare("DELETE FROM meta WHERE key = 'scope_key'").run();
-      this.db.prepare("UPDATE meta SET value = ? WHERE key = 'schema_version'").run(String(SCHEMA_VERSION));
+      this.db.prepare("UPDATE meta SET value = ? WHERE key = 'schema_version'").run("8");
     });
   }
 
@@ -1524,6 +1615,8 @@ export class LocalRepository {
     return this.db.transaction(() => {
       if (!this.db.prepare("SELECT 1 FROM clients WHERE client_id = ? AND revoked_at IS NULL").get(clientId)) return false;
       this.#appendLocalEvent({ entityId: clientId, op: "client_revoked", actor: "owner", occurredAt: timestamp });
+      const pending = this.db.prepare("SELECT message_id FROM messages WHERE from_kind = 'client' AND from_ref = ? AND state = 'pending'").all(clientId);
+      for (const row of pending) this.#expireMessage(row.message_id);
       return true;
     })();
   }
@@ -2120,6 +2213,7 @@ export class LocalRepository {
   }
 
   ingestEvent(event) {
+    if (event?.op?.startsWith("message_")) return false;
     if (event?.owner_id !== this.#meta("owner_id")) throw new Error("event owner_id does not match store owner_id");
     if (typeof event?.event_id === "string" && event.event_id &&
       this.db.prepare("SELECT 1 FROM events WHERE event_id = ?").get(event.event_id)) return false;
@@ -2212,7 +2306,7 @@ export class LocalRepository {
   contentRecords() {
     return this.#withHandoffExpirySweep(() => this.db.prepare(`
         SELECT source_event_id AS event_id, entity_id, content_version, owner_id, content, created_at
-        FROM content_records ORDER BY entity_id, content_version
+        FROM content_records WHERE entity_id NOT IN (SELECT message_id FROM messages) ORDER BY entity_id, content_version
       `).all().map((record) => ({ ...record, content: this.payloadCodec.decode(record.content) })));
   }
 
@@ -2259,6 +2353,205 @@ export class LocalRepository {
         clients,
       };
     });
+  }
+
+  messagingEnabled() {
+    return this.#meta("messaging") !== "off";
+  }
+
+  setMessaging(enabled) {
+    this.#setMeta("messaging", enabled ? "on" : "off");
+    return this.messagingEnabled();
+  }
+
+  requireMessagingClient(input, { owner = false } = {}) {
+    if (!this.messagingEnabled()) throw new Error("messaging_disabled");
+    if (owner) return null;
+    const client = this.authenticate(input?.client_id, input?.client_secret);
+    if (!client) throw new Error("authentication failed");
+    return client;
+  }
+
+  messageStatus(messageId, input = null) {
+    if (input) {
+      const client = this.requireMessagingClient(input);
+      const row = this.db.prepare("SELECT * FROM messages WHERE message_id = ?").get(messageId);
+      if (!row || !((row.from_kind === "client" && row.from_ref === client.client_id) ||
+        (row.to_kind === "client" && row.to_ref === client.client_id))) throw new Error("message_not_found");
+    }
+    this.expireMessages();
+    const row = this.db.prepare("SELECT * FROM messages WHERE message_id = ?").get(messageId);
+    if (!row) throw new Error("message_not_found");
+    return messageMetadata(row);
+  }
+
+  sendMessage(input, { owner = false, target = null } = {}) {
+    return this.db.transaction(() => {
+      const client = this.requireMessagingClient(input, { owner });
+      requireUuid(input?.idempotency_key, "idempotency_key");
+      if (typeof input.body !== "string" || !input.body.trim() || Buffer.byteLength(input.body) > MAX_CONTENT_BYTES) throw new Error("invalid message body");
+      if (screenContent(input.body)) throw new Error("message_content_refused");
+      const local = this.db.prepare("SELECT * FROM clients WHERE client_id = ? AND revoked_at IS NULL").get(input.to);
+      target ??= local ? { kind: "client", ref: local.client_id } : null;
+      if (!target || !["client", "hosted"].includes(target.kind)) throw new Error("invalid message target");
+      if (target.kind === "client" && !local) throw new Error("invalid target client");
+      const fromKind = owner ? "owner" : "client";
+      const fromRef = client?.client_id ?? null;
+      const requestHash = createHash("sha256").update(json([input.to, input.reply_to ?? null, input.body])).digest("hex");
+      const existing = this.db.prepare("SELECT * FROM messages WHERE from_kind = ? AND from_ref IS ? AND idempotency_key = ?")
+        .get(fromKind, fromRef, input.idempotency_key);
+      if (existing) {
+        if (existing.request_hash !== requestHash) throw new Error("idempotency_conflict");
+        return { ...this.messageStatus(existing.message_id), replayed: true };
+      }
+      let parent = null;
+      if (input.reply_to != null) {
+        requireUuid(input.reply_to, "reply_to");
+        parent = this.db.prepare("SELECT * FROM messages WHERE message_id = ?").get(input.reply_to);
+        if (!parent || parent.to_kind !== "client" || (!owner && parent.to_ref !== fromRef) ||
+          parent.from_kind !== target.kind || parent.from_ref !== target.ref) throw new Error("invalid reply_to");
+        if (target.kind === "hosted" && parent.link_key !== target.link_key) throw new Error("invalid reply_to link");
+      }
+      const row = {
+        message_id: this.uuid(), conversation_id: parent?.conversation_id ?? this.uuid(),
+        reply_to: parent?.message_id ?? null, from_kind: fromKind, from_ref: fromRef,
+        from_label: client?.label ?? "Owner", to_kind: target.kind, to_ref: target.ref,
+        origin: "local", hosted_message_id: null,
+        hosted_group_id: parent?.hosted_group_id ?? target.group_id ?? null,
+        hosted_conversation_id: parent?.hosted_conversation_id ?? null,
+        hosted_sender_id: target.sender_id ?? null, link_key: target.link_key ?? null,
+        idempotency_key: input.idempotency_key, request_hash: requestHash,
+        created_at: this.#now(), expires_at: new Date(Date.parse(this.#now()) + DEFAULT_HANDOFF_TTL_MS).toISOString(),
+      };
+      this.#insertMessage(row, input.body);
+      return this.messageStatus(row.message_id);
+    }).immediate();
+  }
+
+  #insertMessage(row, body) {
+    const event = this.#appendLocalEvent({ entityId: row.message_id, op: "message_created", actor: row.from_kind === "client" ? "client" : "owner", clientId: row.from_kind === "client" ? row.from_ref : null });
+    const keys = Object.keys(row);
+    this.db.prepare(`INSERT INTO messages (${keys.join(",")}, content_version, state) VALUES (${keys.map(k => `@${k}`).join(",")}, 1, 'pending')`).run(row);
+    this.db.prepare("INSERT INTO content_records(source_event_id, entity_id, content_version, owner_id, content, created_at) VALUES (?, ?, 1, ?, ?, ?)")
+      .run(event.event_id, row.message_id, event.owner_id, this.payloadCodec.encode(body), row.created_at);
+  }
+
+  acceptHostedMessage(clientId, message, linkKey) {
+    return this.db.transaction(() => {
+      if (!this.messagingEnabled()) throw new Error("messaging_disabled");
+      if (!this.db.prepare("SELECT 1 FROM clients WHERE client_id = ? AND revoked_at IS NULL").get(clientId)) throw new Error("invalid target client");
+      const existing = this.db.prepare("SELECT * FROM messages WHERE origin = 'hosted' AND hosted_message_id = ?").get(message.id);
+      if (existing) {
+        if (existing.to_ref !== clientId || existing.link_key !== linkKey) throw new Error("invalid hosted recipient");
+        return existing;
+      }
+      for (const field of ["id", "conversation_id", "group_id", "sender_agent_id", "recipient_agent_id"]) requireUuid(message[field], field);
+      if (typeof message.body !== "string" || !message.body.trim() || Buffer.byteLength(message.body) > MAX_CONTENT_BYTES || screenContent(message.body)) throw new Error("message_content_refused");
+      if (!Number.isFinite(Date.parse(message.expires_at)) || !Number.isFinite(Date.parse(message.created_at))) throw new Error("invalid message dates");
+      const parent = message.reply_to ? this.db.prepare("SELECT * FROM messages WHERE origin = 'local' AND hosted_receipt_id = ? AND link_key = ? AND hosted_sender_id = ? AND to_ref = ?")
+        .get(message.reply_to, linkKey, message.recipient_agent_id, message.sender_agent_id) : null;
+      const row = {
+        message_id: this.uuid(), conversation_id: parent?.conversation_id ?? message.conversation_id,
+        reply_to: parent?.message_id ?? null, from_kind: "hosted", from_ref: message.sender_agent_id,
+        from_label: typeof message.sender_label === "string" ? message.sender_label.slice(0, 120) : message.sender_agent_id,
+        to_kind: "client", to_ref: clientId, origin: "hosted", hosted_message_id: message.id,
+        hosted_group_id: message.group_id, hosted_conversation_id: message.conversation_id,
+        hosted_sender_id: message.recipient_agent_id, link_key: linkKey,
+        idempotency_key: message.id, request_hash: "hosted",
+        created_at: message.created_at,
+        expires_at: new Date(Math.min(Date.parse(message.expires_at), Date.parse(this.#now()) + DEFAULT_HANDOFF_TTL_MS)).toISOString(),
+      };
+      this.#insertMessage(row, message.body);
+      this.expireMessages();
+      return row;
+    }).immediate();
+  }
+
+  #expireMessage(messageId) {
+    this.db.prepare("UPDATE messages SET state = 'expired' WHERE message_id = ?").run(messageId);
+    this.db.prepare("DELETE FROM content_records WHERE entity_id = ?").run(messageId);
+    this.#appendLocalEvent({ entityId: messageId, op: "message_expired", actor: "owner" });
+  }
+
+  expireMessages() {
+    return this.db.transaction(() => {
+      const rows = this.db.prepare("SELECT message_id FROM messages WHERE state IN ('pending', 'notified', 'delivered') AND expires_at <= ?").all(this.#now());
+      for (const row of rows) this.#expireMessage(row.message_id);
+      return rows.length;
+    }).immediate();
+  }
+
+  receiveMessages(input, { maxChars = Infinity, format = null } = {}) {
+    const limit = input.limit ?? 10;
+    if (!Number.isInteger(limit) || limit < 1 || limit > 10) throw new Error("invalid message limit");
+    return this.db.transaction(() => {
+      const client = this.requireMessagingClient(input);
+      this.expireMessages();
+      if (maxChars <= 0) return { status: "ok", messages: [] };
+      const rows = this.db.prepare(`
+        SELECT m.* FROM messages m
+        LEFT JOIN clients sender ON m.from_kind = 'client' AND sender.client_id = m.from_ref
+        WHERE m.to_kind = 'client' AND m.to_ref = ? AND m.state = 'pending'
+          AND (m.from_kind <> 'client' OR (sender.client_id IS NOT NULL AND sender.revoked_at IS NULL))
+        ORDER BY m.created_at, m.message_id LIMIT 50
+      `).all(client.client_id);
+      const messages = [];
+      let size = 0;
+      for (const row of rows) {
+        const content = this.db.prepare("SELECT content FROM content_records WHERE entity_id = ? AND content_version = ?").get(row.message_id, row.content_version);
+        if (!content) continue;
+        const body = this.payloadCodec.decode(content.content);
+        const message = { ...messageMetadata(row), body };
+        if (format) message.envelope = format(message);
+        const length = (message.envelope ?? body).length + 1;
+        if (size + length > maxChars) continue;
+        size += length;
+        this.db.prepare("UPDATE messages SET state = 'notified', claim_pid = ? WHERE message_id = ? AND state = 'pending'").run(process.pid, row.message_id);
+        messages.push({ ...message, state: "notified" });
+        if (messages.length >= limit) break;
+      }
+      return { status: "ok", messages };
+    }).immediate();
+  }
+
+  ackMessage(input) {
+    return this.db.transaction(() => {
+      const client = this.requireMessagingClient(input);
+      this.expireMessages();
+      const row = this.db.prepare("SELECT * FROM messages WHERE message_id = ? AND to_kind = 'client' AND to_ref = ?").get(input.message_id, client.client_id);
+      if (!row) throw new Error("message_not_found");
+      if (row.state === "notified") {
+        row.state = "delivered";
+        row.delivered_at = this.#now();
+        this.db.prepare("UPDATE messages SET state = 'delivered', delivered_at = ?, claim_pid = NULL WHERE message_id = ?").run(row.delivered_at, row.message_id);
+        this.#appendLocalEvent({ entityId: row.message_id, op: "message_delivered", actor: "client", clientId: client.client_id });
+      } else if (row.state === "pending") throw new Error("message_not_received");
+      return messageMetadata(row);
+    }).immediate();
+  }
+
+  releaseMessage(input) {
+    return this.db.transaction(() => {
+      const client = this.requireMessagingClient(input);
+      this.db.prepare("UPDATE messages SET state = 'pending', claim_pid = NULL WHERE message_id = ? AND to_kind = 'client' AND to_ref = ? AND state = 'notified'").run(input.message_id, client.client_id);
+      return { status: "ok" };
+    }).immediate();
+  }
+
+  completeOutbound(messageId, hosted) {
+    this.db.transaction(() => {
+      const row = this.db.prepare("SELECT * FROM messages WHERE message_id = ?").get(messageId);
+      if (!row || row.state !== "pending") return;
+      for (const field of ["id", "conversation_id", "group_id"]) requireUuid(hosted[field], field);
+      this.db.prepare("UPDATE messages SET state = 'delivered', delivered_at = ?, hosted_receipt_id = ?, hosted_conversation_id = ?, hosted_group_id = ?, last_error = NULL WHERE message_id = ?")
+        .run(this.#now(), hosted.id, hosted.conversation_id, hosted.group_id, messageId);
+      this.#appendLocalEvent({ entityId: messageId, op: "message_delivered", actor: "owner" });
+    }).immediate();
+  }
+
+  listMessages() {
+    this.expireMessages();
+    return this.db.prepare("SELECT message_id, conversation_id, from_kind, from_ref, to_kind, to_ref, state, origin, created_at, expires_at, delivered_at, last_error FROM messages ORDER BY created_at DESC LIMIT 100").all();
   }
 
   close() {

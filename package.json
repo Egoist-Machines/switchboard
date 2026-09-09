@@ -26,7 +26,10 @@
   "engines": {
     "node": ">=22"
   },
-  "exports": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./messaging": "./src/hostedMessaging.js"
+  },
   "bin": {
     "switchboard": "./src/cli.js"
   },
@@ -44,5 +47,13 @@
   },
   "dependencies": {
     "better-sqlite3": "^12.2.0"
+  },
+  "peerDependencies": {
+    "@egoistmachines/passport-messaging": "^0.1.0"
+  },
+  "peerDependenciesMeta": {
+    "@egoistmachines/passport-messaging": {
+      "optional": true
+    }
   }
 }

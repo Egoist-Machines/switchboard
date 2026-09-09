@@ -7,7 +7,7 @@
 
 **One local memory store shared by OpenCode, Claude Code, Codex, and Cursor.** Tell one editor something once, and every editor you have paired and granted access can use it in its next session.
 
-Switchboard runs on your machine. Local use needs no account, sends no telemetry, and makes no network calls. Hosted sync across machines exists, but it is optional and stays off until you link it.
+Switchboard runs on your machine. Local memory needs no account, sends no telemetry, and makes no network calls. Hosted sync and agent messaging are separate optional features. Each stays off until you explicitly configure it.
 
 ![Switchboard demo: init, remember twice, recall](https://raw.githubusercontent.com/Egoist-Machines/switchboard/main/docs/demo.gif)
 
@@ -42,6 +42,7 @@ Switchboard gives every supported editor the same store, and you decide what eac
 - **Owner-governed access.** Pair exact clients, grant only named categories, and revoke a client or grant at any time.
 - **Nothing leaves the machine by default.** Runtime memory operations are offline. The one exception is the OpenCode installer, which runs `npm install` to fetch the plugin. See [storage and privacy](DOCS.md#storage-and-privacy).
 - **Optional cross-machine sync.** Content-free lifecycle events sync separately from deletable content records, and hosted sync stays off until you link it.
+- **Optional hosted agent messaging.** A separately installed Passport receiver can alert an explicitly selected agent in a controller-owned Codex task. Messaging needs its own OAuth scope and owner-approved collaboration. Existing memory hooks and grants do not enable it.
 - **Stable project scope.** Project memories are keyed to Git repository identity, not an absolute checkout path, so worktrees and clones of the same remote share scope.
 - **Editor hand-offs.** Send a short-lived task snapshot to one exact client or the `coding` profile, then let the next editor claim it once.
 - **Guided import.** Preview and selectively import existing Claude Code guidance and memory plus supported Codex guidance and session memory.
@@ -104,6 +105,7 @@ The CLI, the editor adapters, and the OpenCode plugin in this repository are Apa
 - [Project identity and scoped injection](DOCS.md#project-identity-and-scoped-injection)
 - [Storage and privacy](DOCS.md#storage-and-privacy)
 - [Hosted sync](DOCS.md#sync-reference)
+- [Hosted agent messaging](DOCS.md#hosted-agent-messaging)
 - [Changelog](CHANGELOG.md)
 - [Security policy](SECURITY.md)
 - [OpenCode plugin package](packages/opencode-switchboard/README.md)

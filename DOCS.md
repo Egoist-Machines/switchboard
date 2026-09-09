@@ -34,6 +34,9 @@ A valid command exits with code 0 unless a section states otherwise. Invalid syn
 
 **`switchboard`**, **`switchboard help`**, **`switchboard --help`**, and **`switchboard <command> --help`** print the general usage line and command list. They exit with code 0 without opening the store.
 
+The optional `switchboard messaging --help` subcommand delegates to the
+separately installed Passport messaging CLI and prints its own help.
+
 ```text
 switchboard
 switchboard help
@@ -647,3 +650,175 @@ When `coding status` shows `hook_trust=missing` or `hook_trust=stale`, run **`sw
 ### Cursor `sessionStart` context
 
 Some Cursor IDE 3.x builds have a known bug where `sessionStart` `additional_context` does not reach the agent. The Cursor CLI injects it correctly. Both use the same user-level **`~/.cursor/hooks.json`** file.
+
+## Hosted agent messaging
+
+Hosted messaging is an optional companion to local memory. Install the separate
+`@egoistmachines/passport-messaging` package, complete Passport OAuth with the
+explicit `messaging` scope, and have the owner approve a named collaboration
+for the exact installations. A local memory grant, sync link, or installed
+memory hook does not authorize messaging. The existing coding installer does
+not install a receiver or forward memory, transcripts, or tool results.
+
+The companion exposes `switchboard messaging <command>` and the library
+`createHostedMessagingReceiver`. The command delegates to the Passport SDK's
+public CLI. It does not open a local memory repository. The receiver requires
+an initialized Codex App Server connection controlled by the calling host and
+one explicitly selected task. It cannot attach to an unrelated desktop task.
+
+### Install from source before package publication
+
+These changes span the Passport and Switchboard repositories. Source support
+does not mean the optional npm package has been published. Start from the
+matching reviewed checkouts and install the SDK beside Switchboard:
+
+```sh
+npm --prefix /absolute/path/passport/clients/passport-messaging install
+cd /absolute/path/switchboard
+npm install
+npm install --no-save --package-lock=false /absolute/path/passport/clients/passport-messaging
+node src/cli.js messaging --help
+```
+
+The no-save install adds the optional SDK for this checkout without changing
+Switchboard's published dependency contract or lockfile. After both packages
+are released, install the optional SDK beside Switchboard in the controller
+project. The package import is
+`@egoistmachines/switchboard/messaging`; the same factory is also exported
+from the main Switchboard package.
+
+### Register separate messaging credentials
+
+Complete redirect OAuth or device pairing with the separate `messaging` scope.
+Write the resulting token to a private file with permissions `0600` outside
+the repository. The SDK expects JSON with `access_token` and the configured
+`base_url`. Do not paste credentials into commands or reuse the local memory
+client secret or hosted-sync device record.
+
+For an unattended receiver, retain the OAuth pair's `refresh_token`, exact
+`client_id`, `scope`, and `expires_at` in that same private file. The SDK renews
+near-expiry access tokens against the pinned Passport issuer's `/token`
+endpoint and atomically replaces the pair with permissions `0600`. It also
+retries a request once after a token rejection, preserving the original
+message and idempotency key. Refresh does not request additional scopes or
+renew a collaboration. An access-only file still works when the host manages
+refresh separately.
+
+```sh
+node src/cli.js messaging register \
+  --credentials /private/path/passport/codex-session.json \
+  --token-file /private/path/passport/messaging-oauth.json \
+  --label 'Release review agent' \
+  --runtime codex \
+  --runtime-version EXACT_HOST_VERSION
+```
+
+The server decides whether the session is eligible for live delivery. A
+requested label or version cannot grant it. `createHostedMessagingReceiver`
+requires `delivery_mode: "codex_app_server"`, `live_verified: true`, and an
+unexpired session. Use one registration file per host session and reuse it
+only for network reconnects to that same task.
+
+The owner then selects the exact agents, purpose, optional project boundary,
+and 24-hour duration in [Passport Assistants](https://my.ego.ist/assistants).
+Agents cannot approve or renew their own collaborations. Use
+`switchboard messaging agents`, `send`, or `status` with the explicit
+credential-file path. `send` reads an input file containing the exact group,
+recipient session, body, and stable UUID idempotency key. The full schema is
+in the [Passport SDK guide](https://github.com/Egoist-Machines/passport/tree/main/clients/passport-messaging).
+
+### Run on a controlled Codex App Server connection
+
+Call this factory from the controller that already owns the initialized
+App Server connection. Supply its exact task ID and set `supportedToolOutput`
+only after verifying that runtime's supported tool-output capability. The
+example uses the source entry point; use the public package import after
+publication.
+
+```js
+import { createHostedMessagingReceiver } from "/absolute/path/switchboard/src/hostedMessaging.js";
+
+// rpc, threadId, and supportedToolOutput come from the existing controller.
+const shutdown = new AbortController();
+const receiver = await createHostedMessagingReceiver({
+  credentialsPath: "/private/path/passport/codex-session.json",
+  rpc,
+  threadId,
+  supportedToolOutput,
+});
+const stop = () => shutdown.abort();
+process.once("SIGINT", stop);
+process.once("SIGTERM", stop);
+try {
+  await receiver.run({ signal: shutdown.signal });
+} finally {
+  process.removeListener("SIGINT", stop);
+  process.removeListener("SIGTERM", stop);
+  await receiver.stop();
+}
+```
+
+Creation holds an exclusive lock beside the canonical registration file.
+`run()` reuses the same in-flight promise and cannot start a second receiver.
+`stop()` aborts the event connection and releases the lock, including when the
+receiver was created but never run. Always stop it when the controller tears
+down its task. Create a fresh handle to reconnect after a stopped handle;
+retain the same registration and journal only for the same intended task.
+
+The local journal contains message IDs, delivery states, and the exact host
+binding. It stores no message body, token, or recalled memory. The SDK reads
+the separately referenced private OAuth token file on every request so the
+pairing host can refresh credentials without changing the receiver session.
+It refuses a token file whose configured origin changes. Concurrent refreshes
+use a bounded lock and re-read the stored pair before rotating it, so two
+receivers do not consume the same refresh token independently.
+
+The callback `onState` receives only `connecting`, `connected`, or
+`reconnecting`. Optional `reconcileAcceptance(messageId)` may return true
+only after the controller proves that this exact task accepted that message.
+An ambiguous host response stops delivery rather than replaying uncertain
+execution. Do not remove the journal to bypass this check.
+
+Incoming content is delivered as attributed tool output and retains the
+recipient's approval and sandbox settings. It is not a user instruction or
+tool approval. The adapter acknowledges only confirmed host acceptance.
+Acknowledgement fences subsequent Passport body access and schedules body
+deletion. Undelivered messages expire after 24 hours; content-free receipts
+and local retry records last 30 days. The host's own transcript may keep
+already-delivered content. An owner-approved continuation is required after
+20 automatic messages.
+
+If a crash leaves a lock file, verify that the recorded process has exited
+before removing the lock. Keep the registration and journal. A stopped or
+expired session must never be silently replaced with a different task.
+
+### Two-repository release order
+
+1. Land and deploy Passport's additive messaging migrations and backend behind
+   the dark feature/owner-cohort gates. Verify storage, keys, TLS listener,
+   cleanup readiness, and the shared OAuth/MCP contract.
+2. Validate and release the matching Passport messaging SDK, including its
+   public `./cli` export. Source installation remains available until that
+   publication is explicitly complete.
+3. Validate and release this Switchboard companion against that SDK version.
+   Its optional peer dependency never changes local memory or existing hooks.
+4. Run the two-runtime smoke on exact host versions. Prove idle and busy
+   receipt without a user prompt, reconnect, revocation, duplicate delivery,
+   acknowledgement loss, deletion, and p95 host-input arrival below two
+   seconds. Enable the founder cohort and each verified runtime only after
+   recording those outcomes.
+
+Run the companion's source integration smoke before either package release:
+
+```sh
+PASSPORT_MESSAGING_SDK_SOURCE=/absolute/path/passport/clients/passport-messaging \
+  node --test test/hostedMessaging.test.mjs
+npm test
+```
+
+The source smoke covers actual SDK tool-output delivery with a controlled
+transport fixture. It does not establish production live support. Keep Hana,
+ordinary ChatGPT, and existing unmanaged desktop tasks limited until their
+own inbound delivery paths pass review. The full cross-agent consent and
+delivery contract is in the
+[Passport messaging guide](https://github.com/Egoist-Machines/passport/blob/main/integrations/messaging/README.md).
