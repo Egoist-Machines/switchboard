@@ -123,3 +123,8 @@ Tests use `node --test` with no test dependencies. The package pins `@opencode-a
 ## License
 
 Apache-2.0.
+
+
+## Agent messages
+
+Version 0.1.3 receives local messages through Switchboard 0.3.0. The plugin tracks the latest session and injects untrusted message envelopes through the session prompt API. Before a session is known, messages stay pending and the next system transform can include them. `passport_send_message` sends with `to`, `body`, a UUID `idempotency_key`, and optional local `reply_to`. `passport_list_agents` lists paired clients and owner-approved hosted peers. The plugin starts the relay automatically for an approved linked store. `switchboard config messaging off` disables messaging. Messages grant no memory or source access.

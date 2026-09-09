@@ -179,6 +179,18 @@ export function createLocalTransport({
   };
 
   return {
+    receiveMessages(input = {}) {
+      return invoke("message-receive", input, value => {
+        if (value?.status === "ok" && Array.isArray(value.messages) && value.messages.every(m => typeof m.message_id === "string" && typeof m.envelope === "string" && m.envelope.startsWith("<ai-passport-message "))) return value;
+        if (value?.status === "error") return { ...value, messages: [] };
+        return null;
+      }, () => ({ status: "unavailable", messages: [] }));
+    },
+    sendMessage(input = {}) { return invoke("message-send", input, value => value?.message_id || value?.error ? value : null, () => ({ status: "unavailable" })); },
+    ackMessage(input = {}) { return invoke("message-ack", input, value => value?.message_id || value?.error ? value : null, () => ({ status: "unavailable" })); },
+    releaseMessage(input = {}) { return invoke("message-release", input, value => value?.status ? value : null, () => ({ status: "unavailable" })); },
+    messageAgents(input = {}) { return invoke("message-agents", input, value => value?.status ? value : null, () => ({ status: "unavailable" })); },
+    startMessagingRelay() { return invoke("message-relay-start", {}, value => value?.status ? value : null, () => ({ status: "unavailable" })); },
     async status() {
       const result = {
         transport: "local",
