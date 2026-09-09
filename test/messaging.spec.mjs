@@ -220,6 +220,8 @@ test("installer owns only its Claude MCP entry and backs up existing config", t 
   const ownerHome = mkdtempSync("/tmp/switchboard-mcp-install-");
   t.after(() => rmSync(ownerHome, { recursive: true, force: true }));
   const home = path.join(ownerHome, "store");
+  // Host detection accepts the config directory, so CI runners without the binary still qualify.
+  mkdirSync(path.join(ownerHome, ".claude"), { recursive: true });
   const config = path.join(ownerHome, ".claude.json");
   const original = { mcpServers: { other: { command: "other" } }, userSetting: true };
   writeFileSync(config, JSON.stringify(original));
@@ -275,6 +277,8 @@ test("Claude MCP entry participates in installer rollback", t => {
   const ownerHome = mkdtempSync("/tmp/switchboard-mcp-rollback-");
   t.after(() => rmSync(ownerHome, { recursive: true, force: true }));
   const home = path.join(ownerHome, "store");
+  // Host detection accepts the config directory, so CI runners without the binary still qualify.
+  mkdirSync(path.join(ownerHome, ".claude"), { recursive: true });
   const config = path.join(ownerHome, ".claude.json");
   const original = { mcpServers: { other: { command: "other" } }, userSetting: true };
   writeFileSync(config, JSON.stringify(original));
@@ -289,6 +293,8 @@ for (const host of ["claude-code", "codex", "cursor"]) test(`${host} reinstall a
   const home = temporaryHome(t), ownerHome = path.dirname(home);
   const env = { ...process.env, HOME: ownerHome, SWITCHBOARD_HOME: home,
     CODEX_HOME: path.join(ownerHome, ".codex"), XDG_CONFIG_HOME: path.join(ownerHome, ".config") };
+  // Detection accepts each host's config directory, so runners without the binaries still install.
+  for (const directory of [".claude", ".codex", ".cursor"]) mkdirSync(path.join(ownerHome, directory), { recursive: true });
   const run = args => spawnSync(process.execPath, [cli, ...args], { env, encoding: "utf8" });
   assert.equal(run(["init"]).status, 0);
   const install = ["coding", "install", "--targets", host];
