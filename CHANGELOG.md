@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.0
+
+- Add local messages between paired clients with screened bodies in the existing content store, atomic inbox claims, expiry, and content-free receipts.
+- Reuse approved Passport device links for hosted registration, peer discovery, and a singleton relay with SSE reconciliation and an idempotent outbox.
+- Add Claude Code channel delivery, OpenCode push and messaging tools, and prompt inboxes for Claude Code, Codex, and Cursor.
+- Add reversible Claude MCP installation, messaging controls and CLI contracts, and schema version 10 migration.
+- Remove the separate Passport messaging package integration. Bump the OpenCode plugin to 0.1.3.
+
+
 ## 0.2.3 (2026-09-02)
 
 - Included the Cursor adapter in the published npm package. It landed in the repository after 0.2.2 shipped.

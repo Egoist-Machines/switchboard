@@ -4,7 +4,7 @@
     "type": "git",
     "url": "git+https://github.com/Egoist-Machines/switchboard.git"
   },
-  "version": "0.2.3",
+  "version": "0.3.0",
   "type": "module",
   "description": "Switchboard: local-first, model-neutral memory for coding agents. Part of AI Passport.",
   "license": "Apache-2.0",
@@ -28,7 +28,7 @@
   },
   "exports": {
     ".": "./src/index.js",
-    "./messaging": "./src/hostedMessaging.js"
+    "./messaging": "./src/messaging.js"
   },
   "bin": {
     "switchboard": "./src/cli.js"
@@ -43,17 +43,10 @@
     "SECURITY.md"
   ],
   "scripts": {
-    "test": "node --test \"test/*.test.mjs\" \"test/*.spec.mjs\""
+    "test": "node --test \"test/*.test.mjs\" \"test/*.spec.mjs\"",
+    "check": "node --check src/cli.js && node --check src/repository.js && node --check src/messaging.js && node --check src/messagingRelay.js && node --check src/claudeChannel.js && node --check src/hook.js && node --check src/coding.js && node --check packages/opencode-switchboard/src/plugin.js && node --check packages/opencode-switchboard/src/messaging.js && node --check packages/opencode-switchboard/src/localTransport.js"
   },
   "dependencies": {
     "better-sqlite3": "^12.2.0"
-  },
-  "peerDependencies": {
-    "@egoistmachines/passport-messaging": "^0.1.0"
-  },
-  "peerDependenciesMeta": {
-    "@egoistmachines/passport-messaging": {
-      "optional": true
-    }
   }
 }
