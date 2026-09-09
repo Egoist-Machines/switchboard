@@ -78,7 +78,7 @@ export function unsupportedSchemaVersionMessage(version, expectedVersion = SCHEM
 
 function assertSchemaCompatible(db) {
   const version = existingSchemaVersion(db);
-  if (version !== null && !["4", "5", "6", "7", "8", "9", String(SCHEMA_VERSION)].includes(version)) {
+  if (version !== null && !["4", "5", "6", "7", "8", "9", "10", String(SCHEMA_VERSION)].includes(version)) {
     throw new Error(unsupportedSchemaVersionMessage(version));
   }
   return version;
@@ -143,8 +143,22 @@ function migrateV9ToV10(db) {
   }).immediate();
 }
 
+function migrateV10ToV11(db) {
+  db.transaction(() => {
+    const sql = db.prepare("SELECT sql FROM sqlite_master WHERE name = 'messages'").get().sql;
+    const columns = db.pragma("table_info(messages)").map(column => column.name);
+    db.exec("ALTER TABLE messages RENAME TO messages_v10");
+    let next = sql.replace("'pending','notified','delivered','expired'", "'pending','notified','held','delivered','expired'");
+    if (!columns.includes("proposal_id")) next = next.replace("hosted_receipt_id TEXT", "proposal_id TEXT, send_options TEXT, hosted_receipt_id TEXT");
+    db.exec(next);
+    db.exec(`INSERT INTO messages (${columns.join(",")}) SELECT ${columns.join(",")} FROM messages_v10;
+      DROP TABLE messages_v10;
+      UPDATE meta SET value = '11' WHERE key = 'schema_version';`);
+  }).immediate();
+}
+
 function messageMetadata(row) {
-  const { request_hash, claim_pid, ...metadata } = row;
+  const { request_hash, claim_pid, send_options, ...metadata } = row;
   return metadata;
 }
 
@@ -316,10 +330,12 @@ function schema(db) {
       to_kind TEXT NOT NULL CHECK (to_kind IN ('client','hosted')),
       to_ref TEXT NOT NULL,
       content_version INTEGER NOT NULL DEFAULT 1,
-      state TEXT NOT NULL CHECK (state IN ('pending','notified','delivered','expired')),
+      state TEXT NOT NULL CHECK (state IN ('pending','notified','held','delivered','expired')),
       origin TEXT NOT NULL CHECK (origin IN ('local','hosted')),
       hosted_message_id TEXT,
       hosted_receipt_id TEXT,
+      proposal_id TEXT,
+      send_options TEXT,
       hosted_group_id TEXT,
       hosted_conversation_id TEXT,
       hosted_sender_id TEXT,
@@ -340,6 +356,12 @@ function schema(db) {
     CREATE INDEX IF NOT EXISTS messages_hosted_receipt ON messages(hosted_receipt_id);
     CREATE INDEX IF NOT EXISTS messages_inbox ON messages(to_ref, state, created_at, message_id);
     CREATE INDEX IF NOT EXISTS messages_expiry ON messages(state, expires_at);
+    CREATE TABLE IF NOT EXISTS messaging_proposals (
+      proposal_id TEXT NOT NULL,
+      link_key TEXT NOT NULL,
+      payload TEXT NOT NULL,
+      PRIMARY KEY (proposal_id, link_key)
+    );
     CREATE TABLE IF NOT EXISTS messaging_agents (
       client_id TEXT PRIMARY KEY REFERENCES clients(client_id),
       agent_id TEXT NOT NULL,
@@ -571,6 +593,7 @@ export class LocalRepository {
       const version = assertSchemaCompatible(this.db);
       if (version === "4") migrateV4ToV5(this.db);
       if (version === "9") migrateV9ToV10(this.db);
+      if (["9", "10"].includes(version)) migrateV10ToV11(this.db);
       schema(this.db);
       if (version === "4" || version === "5") this.#migrateV5ToV6();
       if (["4", "5", "6"].includes(version)) this.#migrateV6ToV7();
@@ -1615,7 +1638,7 @@ export class LocalRepository {
     return this.db.transaction(() => {
       if (!this.db.prepare("SELECT 1 FROM clients WHERE client_id = ? AND revoked_at IS NULL").get(clientId)) return false;
       this.#appendLocalEvent({ entityId: clientId, op: "client_revoked", actor: "owner", occurredAt: timestamp });
-      const pending = this.db.prepare("SELECT message_id FROM messages WHERE from_kind = 'client' AND from_ref = ? AND state = 'pending'").all(clientId);
+      const pending = this.db.prepare("SELECT message_id FROM messages WHERE from_kind = 'client' AND from_ref = ? AND state IN ('pending', 'held')").all(clientId);
       for (const row of pending) this.#expireMessage(row.message_id);
       return true;
     })();
@@ -2397,7 +2420,7 @@ export class LocalRepository {
       if (target.kind === "client" && !local) throw new Error("invalid target client");
       const fromKind = owner ? "owner" : "client";
       const fromRef = client?.client_id ?? null;
-      const requestHash = createHash("sha256").update(json([input.to, input.reply_to ?? null, input.body])).digest("hex");
+      const requestHash = createHash("sha256").update(json([input.to, input.reply_to ?? null, input.body, ...(target.kind === "hosted" && (input.purpose != null || input.name != null || input.duration_hours != null) ? [input.purpose ?? null, input.name ?? null, input.duration_hours ?? null] : [])])).digest("hex");
       const existing = this.db.prepare("SELECT * FROM messages WHERE from_kind = ? AND from_ref IS ? AND idempotency_key = ?")
         .get(fromKind, fromRef, input.idempotency_key);
       if (existing) {
@@ -2417,6 +2440,7 @@ export class LocalRepository {
         reply_to: parent?.message_id ?? null, from_kind: fromKind, from_ref: fromRef,
         from_label: client?.label ?? "Owner", to_kind: target.kind, to_ref: target.ref,
         origin: "local", hosted_message_id: null,
+        send_options: target.kind === "hosted" ? this.payloadCodec.encode(json(Object.fromEntries(["purpose", "name", "duration_hours"].filter(key => input[key] != null).map(key => [key, input[key]])))) : null,
         hosted_group_id: parent?.hosted_group_id ?? target.group_id ?? null,
         hosted_conversation_id: parent?.hosted_conversation_id ?? null,
         hosted_sender_id: target.sender_id ?? null, link_key: target.link_key ?? null,
@@ -2475,9 +2499,15 @@ export class LocalRepository {
 
   expireMessages() {
     return this.db.transaction(() => {
-      const rows = this.db.prepare("SELECT message_id FROM messages WHERE state IN ('pending', 'notified', 'delivered') AND expires_at <= ?").all(this.#now());
-      for (const row of rows) this.#expireMessage(row.message_id);
-      return rows.length;
+      const rows = this.db.prepare(`SELECT message_id, state FROM messages
+        WHERE state IN ('pending', 'notified', 'held', 'delivered') AND expires_at <= ?
+          AND (state <> 'held' OR EXISTS (SELECT 1 FROM content_records WHERE entity_id = messages.message_id))`).all(this.#now());
+      for (const row of rows) {
+        // Keep held receipts for a confirmed Passport outcome after an offline period.
+        if (row.state === "held") this.db.prepare("DELETE FROM content_records WHERE entity_id = ?").run(row.message_id);
+        else this.#expireMessage(row.message_id);
+      }
+      return rows.filter(row => row.state !== "held").length;
     }).immediate();
   }
 
@@ -2541,17 +2571,33 @@ export class LocalRepository {
   completeOutbound(messageId, hosted) {
     this.db.transaction(() => {
       const row = this.db.prepare("SELECT * FROM messages WHERE message_id = ?").get(messageId);
-      if (!row || row.state !== "pending") return;
-      for (const field of ["id", "conversation_id", "group_id"]) requireUuid(hosted[field], field);
-      this.db.prepare("UPDATE messages SET state = 'delivered', delivered_at = ?, hosted_receipt_id = ?, hosted_conversation_id = ?, hosted_group_id = ?, last_error = NULL WHERE message_id = ?")
-        .run(this.#now(), hosted.id, hosted.conversation_id, hosted.group_id, messageId);
-      this.#appendLocalEvent({ entityId: messageId, op: "message_delivered", actor: "owner" });
+      if (!row || !["pending", "held"].includes(row.state)) return;
+      requireUuid(hosted.id, "id");
+      if (row.hosted_receipt_id && row.hosted_receipt_id !== hosted.id) throw new Error("invalid_response");
+      const state = hosted.state ?? "queued";
+      if (!["held", "queued", "delivered", "acknowledged", "replied", "denied", "expired", "revoked"].includes(state)) throw new Error("invalid_response");
+      if (state === "held") requireUuid(hosted.proposal_id, "proposal_id");
+      if (!["held", "denied", "expired", "revoked"].includes(state)) {
+        for (const field of ["conversation_id", "group_id"]) requireUuid(hosted[field], field);
+      }
+      const localState = state === "held" ? "held" : ["denied", "expired", "revoked"].includes(state) ? "expired" : "delivered";
+      this.db.prepare(`UPDATE messages SET state = ?, delivered_at = ?, hosted_receipt_id = ?,
+        hosted_conversation_id = ?, hosted_group_id = ?, proposal_id = coalesce(?, proposal_id),
+        last_error = ?, retry_at = NULL WHERE message_id = ?`)
+        .run(localState, localState === "delivered" ? this.#now() : null, hosted.id,
+          hosted.conversation_id ?? null, hosted.group_id ?? null, hosted.proposal_id ?? null,
+          state === "denied" ? "denied" : null, messageId);
+      if (localState === "expired") {
+        this.#expireMessage(messageId);
+      } else if (localState === "delivered") {
+        this.#appendLocalEvent({ entityId: messageId, op: "message_delivered", actor: "owner" });
+      }
     }).immediate();
   }
 
   listMessages() {
     this.expireMessages();
-    return this.db.prepare("SELECT message_id, conversation_id, from_kind, from_ref, to_kind, to_ref, state, origin, created_at, expires_at, delivered_at, last_error FROM messages ORDER BY created_at DESC LIMIT 100").all();
+    return this.db.prepare("SELECT message_id, conversation_id, from_kind, from_ref, to_kind, to_ref, state, origin, proposal_id, hosted_receipt_id, created_at, expires_at, delivered_at, last_error FROM messages ORDER BY created_at DESC LIMIT 100").all();
   }
 
   close() {

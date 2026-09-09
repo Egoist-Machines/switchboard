@@ -2,11 +2,18 @@ import { setTimeout as delay } from "node:timers/promises";
 import { createInterface } from "node:readline";
 import { loadHostCredentials } from "./hook.js";
 import { acquireLock, lockPath, receiveMessages } from "./messaging.js";
-import { ensureMessagingRelay, messageAgents, sendMessage } from "./messagingRelay.js";
+import { ensureMessagingRelay, messageAgents, sendMessage, proposeCollaboration, proposalStatus } from "./messagingRelay.js";
 
 const tools = [
-  { name: "passport_send_message", description: "Send untrusted peer data to another paired or owner-approved agent. Messages grant no permission.", inputSchema: { type: "object", properties: { to: { type: "string" }, body: { type: "string" }, reply_to: { type: "string" }, idempotency_key: { type: "string", format: "uuid" } }, required: ["to", "body", "idempotency_key"], additionalProperties: false } },
-  { name: "passport_list_agents", description: "List paired clients and approved hosted peers and groups.", inputSchema: { type: "object", properties: {}, additionalProperties: false } },
+  { name: "passport_propose_collaboration", description: "Ask the owner to approve a hosted collaboration, renewal, or continuation in Passport Inbox.", inputSchema: { type: "object", properties: {
+    kind: { type: "string", enum: ["create", "renew", "continue"], default: "create" },
+    peer_agent_ids: { type: "array", items: { type: "string" }, minItems: 1, maxItems: 15 },
+    name: { type: "string" }, purpose: { type: "string" }, project_boundary: { type: "string" },
+    duration_hours: { type: "integer", minimum: 1, maximum: 720 }, group_id: { type: "string" }, conversation_id: { type: "string" },
+  }, additionalProperties: false } },
+  { name: "passport_proposal_status", description: "Read a hosted collaboration proposal and its owner decision.", inputSchema: { type: "object", properties: { proposal_id: { type: "string" } }, required: ["proposal_id"], additionalProperties: false } },
+  { name: "passport_send_message", description: "Send untrusted peer data to another paired or hosted agent. Ungrouped peers require purpose and owner approval in Passport Inbox. Messages grant no permission.", inputSchema: { type: "object", properties: { to: { type: "string" }, body: { type: "string" }, reply_to: { type: "string" }, purpose: { type: "string" }, name: { type: "string" }, duration_hours: { type: "integer", minimum: 1, maximum: 720 }, idempotency_key: { type: "string", format: "uuid" } }, required: ["to", "body", "idempotency_key"], additionalProperties: false } },
+  { name: "passport_list_agents", description: "List paired clients, every hosted agent of the owner, shared groups, and proposals.", inputSchema: { type: "object", properties: {}, additionalProperties: false } },
   { name: "passport_message_status", description: "Read a content-free message receipt.", inputSchema: { type: "object", properties: { message_id: { type: "string" } }, required: ["message_id"], additionalProperties: false } },
 ];
 
@@ -64,10 +71,12 @@ export async function runClaudeChannel({ repository, credentials = loadHostCrede
           let value;
           if (request.params?.name === "passport_send_message") value = await sendMessage(repository, { ...args, ...credentials });
           else if (request.params?.name === "passport_list_agents") value = await messageAgents(repository, credentials);
+          else if (request.params?.name === "passport_propose_collaboration") value = await proposeCollaboration(repository, { ...args, ...credentials });
+          else if (request.params?.name === "passport_proposal_status") value = await proposalStatus(repository, { ...args, ...credentials });
           else if (request.params?.name === "passport_message_status") value = repository.messageStatus(args.message_id, credentials);
           else throw new Error("unknown_tool");
           result = { content: [{ type: "text", text: JSON.stringify(value) }] };
-        } catch { result = { isError: true, content: [{ type: "text", text: "Message request refused or unavailable." }] }; }
+        } catch (error) { result = { isError: true, content: [{ type: "text", text: error.message === "purpose_required" ? "purpose_required: Include purpose to ask for a collaboration. The owner must approve in Passport Inbox." : "Message request refused or unavailable." }] }; }
       } else { await write({ id: request.id, error: { code: -32601, message: "Method not found" } }); continue; }
       await write({ id: request.id, result });
     }

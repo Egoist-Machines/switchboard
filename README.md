@@ -79,7 +79,7 @@ switchboard message send --to <client_id> "Please review the parser changes."
 switchboard message list
 ```
 
-Messages grant no permission or memory access. Use `switchboard config messaging off` to disable them. Linked stores can also reach approved hosted peers such as Muse. See [agent messaging](DOCS.md#messages-between-agents) for host delivery and agent tools.
+Messages grant no permission or memory access. Use `switchboard config messaging off` to disable them. Linked stores discover every hosted agent belonging to the owner, including peers such as Muse. Shared groups appear in `shared_group_ids`, alongside collaboration proposals. To reach a peer without a shared group, send with `--purpose "why these agents should collaborate"`, or use `switchboard message propose --to <agent_id> --purpose "..."`. The message stays `held` until the owner approves in Passport Inbox on web or iOS. Passport sends a push notification. `switchboard messaging status` shows held messages and pending proposals. See [agent messaging](DOCS.md#messages-between-agents) for host delivery and agent tools.
 
 ### 4. Link sync, if you want it
 

@@ -16,7 +16,7 @@ import { resolveProjectIdentity, resolveProjectScope, resolveProjectScopes } fro
 import { resolveSwitchboardHome } from "./storage.js";
 import { randomUUID } from "node:crypto";
 import { receiveMessages } from "./messaging.js";
-import { MessagingRelay, messageAgents, messagingStatus, sendMessage, ensureMessagingRelay } from "./messagingRelay.js";
+import { MessagingRelay, messageAgents, messagingStatus, refreshMessagingStatus, sendMessage, proposeCollaboration, proposalStatus, ensureMessagingRelay } from "./messagingRelay.js";
 import { runClaudeChannel } from "./claudeChannel.js";
 
 const packageJson = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
@@ -123,10 +123,10 @@ function writeDiscovery(home) {
 
 function printUsage() {
   process.stdout.write(`Usage: switchboard <command>\n\n` +
-    "Commands: init, status, remember, recall, inbox, client, grant, profile, config, memory, handoff, link, unlink, sync [--replay-from <seq>], doctor, coding, hook, prefetch, propose, handoff-create, handoff-claim, message, message-send, message-receive, message-ack, message-agents, messaging, channel\n" +
+    "Commands: init, status, remember, recall, inbox, client, grant, profile, config, memory, handoff, link, unlink, sync [--replay-from <seq>], doctor, coding, hook, prefetch, propose, handoff-create, handoff-claim, message, message-send, message-receive, message-ack, message-agents, message-propose, message-proposal-status, messaging, channel\n" +
     "Version: switchboard --version, switchboard -v, switchboard version\n" +
     "Coding: switchboard coding import [--project <path>] [--dry-run]\n" +
-    "Messaging: switchboard message send --to <id> <text>; switchboard messaging status|relay; switchboard config messaging on|off\n");
+    "Messaging: switchboard message send --to <id> [--purpose <text>] <text>; switchboard message propose --to <id>[,<id>] --purpose <text> [--name N] [--duration-hours H]; switchboard messaging status|relay; switchboard config messaging on|off\n");
 }
 
 function humanRows(rows) {
@@ -164,6 +164,8 @@ async function runMachine(command, repository, preparedInput = null) {
     if (command.startsWith("message-")) {
       let result;
       if (command === "message-send") result = await sendMessage(repository, input);
+      else if (command === "message-propose") result = await proposeCollaboration(repository, input);
+      else if (command === "message-proposal-status") result = await proposalStatus(repository, input);
       else if (command === "message-receive") {
         repository.requireMessagingClient(input);
         ensureMessagingRelay(repository);
@@ -229,7 +231,7 @@ async function runMachine(command, repository, preparedInput = null) {
     throw new Error("unknown machine command");
   } catch (error) {
     if (command.startsWith("message-")) {
-      const known = /^(messaging_disabled|message_content_refused|message_not_found|message_not_received|idempotency_conflict|messaging_unlinked_or_disabled)$/;
+      const known = /^(purpose_required|proposal_not_found|proposal_limit|agent_required|messaging_disabled|message_content_refused|message_not_found|message_not_received|idempotency_conflict|messaging_unlinked_or_disabled)$/;
       writeJson({ status: "error", error: known.test(error.message) ? error.message : /authentication/.test(error.message) ? "unauthorized" : /invalid|ambiguous/.test(error.message) ? "invalid_request" : "unavailable" });
       return 0;
     }
@@ -286,7 +288,7 @@ async function main(args = process.argv.slice(2)) {
     process.stderr.write("Run switchboard init first\n");
     return 2;
   }
-  const machineCommand = ["prefetch", "propose", "handoff-create", "handoff-claim", "message-send", "message-receive", "message-ack", "message-agents", "message-release", "message-relay-start"].includes(command) && has(args, "--json");
+  const machineCommand = ["prefetch", "propose", "handoff-create", "handoff-claim", "message-send", "message-propose", "message-proposal-status", "message-receive", "message-ack", "message-agents", "message-release", "message-relay-start"].includes(command) && has(args, "--json");
   let machineInput = null;
   if (machineCommand) {
     try {
@@ -329,7 +331,7 @@ async function main(args = process.argv.slice(2)) {
       return await runClaudeChannel({ repository });
     }
     if (command === "messaging") {
-      if (args[1] === "status") writeJson(messagingStatus(repository));
+      if (args[1] === "status") writeJson(await refreshMessagingStatus(repository));
       else if (args[1] === "relay") {
         const controller = new AbortController();
         const stop = () => controller.abort();
@@ -346,15 +348,25 @@ async function main(args = process.argv.slice(2)) {
     if (command === "message") {
       if (args[1] === "list") writeJson(repository.listMessages());
       else if (args[1] === "agents") writeJson(await messageAgents(repository));
+      else if (args[1] === "propose") {
+        writeJson(await proposeCollaboration(repository, {
+          client_id: option(args, "--from"),
+          to: option(args, "--to"), kind: option(args, "--kind"), purpose: option(args, "--purpose"),
+          name: option(args, "--name"), project_boundary: option(args, "--project-boundary"),
+          duration_hours: option(args, "--duration-hours") == null ? undefined : Number(option(args, "--duration-hours")),
+          group_id: option(args, "--group-id"), conversation_id: option(args, "--conversation-id"),
+        }, { owner: true }));
+      }
+      else if (args[1] === "proposal-status") writeJson(await proposalStatus(repository, { proposal_id: args[2] }, { owner: true }));
       else if (args[1] === "send") {
         const positional = [];
         for (let i = 2; i < args.length; i++) {
-          if (["--to", "--reply-to"].includes(args[i])) { i++; continue; }
+          if (["--to", "--reply-to", "--purpose", "--name", "--duration-hours"].includes(args[i])) { i++; continue; }
           positional.push(args[i]);
         }
         if (positional.length !== 1) throw new Error("message send requires text");
-        writeJson(await sendMessage(repository, { to: option(args, "--to"), reply_to: option(args, "--reply-to"), body: positional[0], idempotency_key: randomUUID() }, { owner: true }));
-      } else throw new Error("message requires send, list, or agents");
+        writeJson(await sendMessage(repository, { to: option(args, "--to"), reply_to: option(args, "--reply-to"), purpose: option(args, "--purpose"), name: option(args, "--name"), duration_hours: option(args, "--duration-hours") == null ? undefined : Number(option(args, "--duration-hours")), body: positional[0], idempotency_key: randomUUID() }, { owner: true }));
+      } else throw new Error("message requires send, propose, proposal-status, list, or agents");
       return 0;
     }
     if (command === "hook-worker") {
@@ -642,7 +654,14 @@ async function main(args = process.argv.slice(2)) {
     throw new Error("unknown command");
   } catch (error) {
     if (["message", "messaging", "channel"].includes(command)) {
-      const safe = /^(?:invalid |message |messaging |channel |ambiguous hosted label: )[a-zA-Z0-9 ,:_-]+$/.test(error.message) || /^(?:messaging_[a-z_]+|message_[a-z_]+|channel_already_running|authentication failed)$/.test(error.message);
+      if (error.message === "purpose_required") {
+        process.stderr.write('purpose_required: Pass --purpose "why these agents should collaborate". The owner must approve in Passport Inbox.\n');
+        return 2;
+      }
+      const safe = [
+        "Cannot determine a local member of this group; pass --from <client_id> to select the sending installation",
+        "--from must name an active local client_id",
+      ].includes(error.message) || /^(?:invalid |message |messaging |channel |ambiguous hosted label: )[a-zA-Z0-9 ,:_-]+$/.test(error.message) || /^(?:messaging_[a-z_]+|message_[a-z_]+|channel_already_running|authentication failed)$/.test(error.message);
       process.stderr.write(`${safe ? error.message : "Messaging is unavailable."}\n`);
       return 2;
     }

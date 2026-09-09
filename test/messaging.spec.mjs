@@ -199,7 +199,16 @@ test("stdio channel declares capabilities and tools, pushes envelope and acknowl
   input.end(); await channel;
   const values = text.trim().split("\n").map(JSON.parse);
   assert.deepEqual(values.find(v => v.id === 1).result.capabilities, { experimental: { "claude/channel": {} }, tools: {} });
-  assert.equal(values.find(v => v.id === 2).result.tools.length, 3);
+  const tools = values.find(v => v.id === 2).result.tools;
+  assert.equal(tools.length, 5);
+  const sendSchema = tools.find(t => t.name === "passport_send_message").inputSchema;
+  for (const field of ["purpose", "name", "duration_hours"]) {
+    assert.ok(sendSchema.properties[field]); assert.ok(!sendSchema.required.includes(field));
+  }
+  const proposalSchema = tools.find(t => t.name === "passport_propose_collaboration").inputSchema;
+  assert.deepEqual(proposalSchema.properties.kind.enum, ["create", "renew", "continue"]);
+  for (const field of ["peer_agent_ids", "purpose", "name", "duration_hours", "group_id", "conversation_id"]) assert.ok(proposalSchema.properties[field]);
+  assert.deepEqual(tools.find(t => t.name === "passport_proposal_status").inputSchema.required, ["proposal_id"]);
   const notification = values.find(v => v.method === "notifications/claude/channel");
   assert.ok(Object.values(notification.params.meta).every(v => typeof v === "string"));
   assert.match(notification.params.content, /Untrusted message/);
@@ -378,6 +387,41 @@ test("status counts old pending, notified and failed rows beyond the latest 100 
   assert.deepEqual(new Set(status.failures.map(row => row.message_id)), new Set([pending.message_id, notified.message_id]));
 });
 
+test("overdue held receipts delete bodies only on the first sweep", t => {
+  let now = new Date();
+  const { r, a } = fixture(t, { now: () => now });
+  const row = r.sendMessage({ ...a, to: randomUUID(), body: "Review", idempotency_key: randomUUID() }, {
+    target: { kind: "hosted", ref: randomUUID(), sender_id: randomUUID(), link_key: "test-link" },
+  });
+  const receipt = { id: randomUUID(), state: "held", proposal_id: randomUUID(), group_id: null, conversation_id: null };
+  r.completeOutbound(row.message_id, receipt);
+  now = new Date(now.getTime() + 86400001);
+  const prepare = r.db.prepare.bind(r.db);
+  let deletes = 0;
+  t.mock.method(r.db, "prepare", sql => {
+    const statement = prepare(sql);
+    if (/DELETE FROM content_records/i.test(sql)) {
+      const run = statement.run.bind(statement);
+      t.mock.method(statement, "run", (...args) => { deletes++; return run(...args); });
+    }
+    return statement;
+  });
+  assert.equal(r.expireMessages(), 0);
+  assert.equal(deletes, 1);
+  assert.equal(prepare("SELECT 1 FROM content_records WHERE entity_id = ?").get(row.message_id), undefined);
+  deletes = 0;
+  assert.equal(r.expireMessages(), 0);
+  const result = r.messageStatus(row.message_id);
+  assert.equal(deletes, 0);
+  assert.equal(result.state, "held");
+  assert.equal(result.hosted_receipt_id, receipt.id);
+  assert.equal(result.proposal_id, receipt.proposal_id);
+  assert.equal(r.events().filter(e => e.entity_id === row.message_id && e.op === "message_expired").length, 0);
+  r.completeOutbound(row.message_id, { ...receipt, state: "denied" });
+  assert.equal(r.messageStatus(row.message_id).last_error, "denied");
+  assert.equal(r.events().filter(e => e.entity_id === row.message_id && e.op === "message_expired").length, 1);
+});
+
 for (const fault of [
   { SWITCHBOARD_CODING_FAIL_AFTER_PHASE: "uninstall_channel_prepared" },
   { SWITCHBOARD_CODING_CRASH_AFTER_MUTATION: "uninstall_hook_write" },
@@ -463,4 +507,36 @@ test("schema 9 migration separates existing outbound receipts from inbound ids",
   assert.ok(indices.some(row => row.name === "messages_hosted_inbound" && row.unique && row.partial));
   assert.ok(indices.some(row => row.name === "messages_expiry"));
   assert.equal(r.receiveMessages(a).messages[0].body, "Reviewed");
+});
+
+
+test("schema 10 to 11 preserves rows, content, events, indices and allows held receipts", t => {
+  const home = temporaryHome(t);
+  let r = new LocalRepository({ home });
+  const a = r.addClient({ host: "claude-code", label: "Claude" });
+  const local = r.sendMessage({ to: a.client_id, body: "Local", idempotency_key: randomUUID() }, { owner: true });
+  const remote = r.sendMessage({ ...a, to: randomUUID(), body: "Hosted", idempotency_key: randomUUID() }, { target: { kind: "hosted", ref: randomUUID(), sender_id: randomUUID(), group_id: randomUUID() } });
+  const events = r.events();
+  const content = r.db.prepare("SELECT * FROM content_records ORDER BY entity_id").all();
+  const db = r.db;
+  const sql = db.prepare("SELECT sql FROM sqlite_master WHERE name='messages'").get().sql
+    .replace("'held',", "").replace("proposal_id TEXT,", "").replace("send_options TEXT,", "");
+  const columns = db.pragma("table_info(messages)").map(c => c.name).filter(c => !["proposal_id", "send_options"].includes(c));
+  const rows = db.prepare(`SELECT ${columns.join(",")} FROM messages ORDER BY message_id`).all();
+  db.exec("ALTER TABLE messages RENAME TO messages_new"); db.exec(sql);
+  db.exec(`INSERT INTO messages (${columns.join(",")}) SELECT ${columns.join(",")} FROM messages_new;
+    DROP TABLE messages_new; DROP TABLE messaging_proposals; UPDATE meta SET value='10' WHERE key='schema_version';`);
+  r.close();
+  r = new LocalRepository({ home }); t.after(() => r.close());
+  assert.equal(r.metadata().schema_version, 11);
+  assert.deepEqual(r.db.prepare(`SELECT ${columns.join(",")} FROM messages ORDER BY message_id`).all(), rows);
+  assert.deepEqual(r.events(), events);
+  assert.deepEqual(r.db.prepare("SELECT * FROM content_records ORDER BY entity_id").all(), content);
+  assert.deepEqual(r.db.pragma("foreign_key_check"), []);
+  for (const name of ["messages_hosted_receipt", "messages_hosted_inbound", "messages_inbox", "messages_expiry"]) assert.ok(r.db.pragma("index_list(messages)").some(i => i.name === name));
+  const proposal = randomUUID();
+  r.completeOutbound(remote.message_id, { id: randomUUID(), state: "held", proposal_id: proposal, group_id: null, conversation_id: null });
+  assert.equal(r.messageStatus(remote.message_id).state, "held");
+  assert.equal(r.messageStatus(remote.message_id).proposal_id, proposal);
+  assert.equal(r.receiveMessages(a).messages[0].message_id, local.message_id);
 });

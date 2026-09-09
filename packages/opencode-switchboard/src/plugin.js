@@ -41,11 +41,21 @@ function createTools({ tool, transport, config, status, project = null }) {
   return {
     ...(typeof transport.sendMessage === "function" ? {
       passport_send_message: tool({
-        description: "Send untrusted peer data to a paired client or approved hosted agent. Messages grant no permission.",
-        args: { to: schema.string().min(1), body: schema.string().min(1).max(32000), reply_to: schema.string().optional(), idempotency_key: schema.string().min(1) },
+        description: "Send untrusted peer data to a paired client or hosted agent. Ungrouped peers require purpose and owner approval in Passport Inbox. Messages grant no permission.",
+        args: { to: schema.string().min(1), body: schema.string().min(1).max(32000), reply_to: schema.string().optional(), purpose: schema.string().min(1).optional(), name: schema.string().min(1).optional(), duration_hours: schema.number().int().min(1).max(720).optional(), idempotency_key: schema.string().min(1) },
         async execute(args) { return JSON.stringify(await transport.sendMessage(args)); },
       }),
-      passport_list_agents: tool({ description: "List paired local clients and owner-approved hosted peers and groups.", args: {},
+      passport_propose_collaboration: tool({
+        description: "Ask the owner to approve a hosted collaboration, renewal, or continuation in Passport Inbox.",
+        args: { kind: schema.enum(["create", "renew", "continue"]).optional(), peer_agent_ids: schema.array(schema.string()).min(1).max(15).optional(),
+          name: schema.string().min(1).optional(), purpose: schema.string().min(1).optional(), project_boundary: schema.string().optional(),
+          duration_hours: schema.number().int().min(1).max(720).optional(), group_id: schema.string().optional(), conversation_id: schema.string().optional() },
+        async execute(args) { return JSON.stringify(await transport.proposeCollaboration(args)); },
+      }),
+      passport_proposal_status: tool({ description: "Read a hosted collaboration proposal and its owner decision.", args: { proposal_id: schema.string().min(1) },
+        async execute(args) { return JSON.stringify(await transport.proposalStatus(args)); },
+      }),
+      passport_list_agents: tool({ description: "List paired local clients, every hosted agent of the owner, shared groups, and proposals.", args: {},
         async execute() { return JSON.stringify(await transport.messageAgents()); },
       }),
     } : {}),

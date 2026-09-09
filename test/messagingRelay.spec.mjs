@@ -7,20 +7,34 @@ import { readFileSync, writeFileSync, unlinkSync, existsSync } from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import { setTimeout as delay } from "node:timers/promises";
 import { LocalRepository } from "../src/repository.js";
-import { MessagingRelay, messageAgents, sendMessage, messagingLinkKey, approvedMessagingLink, messagingStatus, ensureMessagingRelay } from "../src/messagingRelay.js";
+import { MessagingRelay, messageAgents, sendMessage, messagingLinkKey, approvedMessagingLink, messagingStatus, refreshMessagingStatus, proposeCollaboration, proposalStatus, ensureMessagingRelay } from "../src/messagingRelay.js";
 import { receiveMessages, acquireLock, lockPath, LockBlockedError } from "../src/messaging.js";
 import { writeHostedLink, forgetHostedLink } from "../src/hostedLink.js";
 import { temporaryHome } from "./helpers.mjs";
 
-async function fixture(t) {
+async function fixture(t, { grouped = true, dropFirst = true, holdKind = null } = {}) {
   const r = new LocalRepository({ home: temporaryHome(t) });
   t.after(() => r.close());
   const a = r.addClient({ host: "claude-code", label: "Claude" });
   const b = r.addClient({ host: "codex", label: "Codex" });
   const registrations = new Map(), seen = [], inbox = [], acknowledgements = new Set(), streams = new Map(), sent = new Map();
+  const proposals = new Map();
   const hosted = { id: randomUUID(), label: "Muse", runtime: "muse", live: true };
   const groupId = randomUUID();
-  let lostReply = false;
+  let lostReply = !dropFirst;
+  const proposalFor = (body, agentId) => {
+    const kind = body.kind ?? holdKind ?? "create";
+    const agentIds = body.agent_ids ?? [agentId, body.recipient_agent_id];
+    const prior = [...proposals.values()].find(p => p.state === "pending" && p.kind === kind && p.agent_ids.join() === agentIds.join());
+    if (prior) return { ...prior, replayed: true };
+    const proposal = { id: randomUUID(), kind, state: "pending", proposer_agent_id: agentId,
+      agent_ids: agentIds, purpose: body.purpose ?? "Existing collaboration", name: body.name ?? "Review",
+      duration_hours: body.duration_hours ?? 168, project_boundary: body.project_boundary ?? null,
+      group_id: body.group_id ?? null, conversation_id: body.conversation_id ?? null, held_message_ids: [],
+      created_at: new Date().toISOString(), expires_at: new Date(Date.now() + 86400000).toISOString(), decided_at: null };
+    proposals.set(proposal.id, proposal);
+    return proposal;
+  };
   const handler = async (req, res) => {
     try {
       assert.equal(req.headers.authorization, `Bearer apsd_${"a".repeat(43)}`);
@@ -40,7 +54,20 @@ async function fixture(t) {
       }
       assert.ok([...registrations.values()].some(a => a.id === agentId), "device requests must name their agent");
       if (route === "agents") {
-        json({ self: [...registrations.values()].find(a => a.id === agentId), agents: [hosted, ...[...registrations.values()].filter(a => a.id !== agentId)], groups: [{ id: groupId, name: "Review", purpose: "Review code", agent_ids: [...registrations.values()].map(a => a.id).concat(hosted.id), expires_at: new Date(Date.now() + 86400000).toISOString() }] });
+        const peers = [hosted, ...[...registrations.values()].filter(a => a.id !== agentId)];
+        json({ self: [...registrations.values()].find(a => a.id === agentId),
+          agents: peers.map(a => ({ ...a, shared_group_ids: grouped ? [groupId] : [] })),
+          groups: grouped ? [{ id: groupId, name: "Review", purpose: "Review code", agent_ids: [...registrations.values()].map(a => a.id).concat(hosted.id), expires_at: new Date(Date.now() + 86400000).toISOString() }] : [],
+          proposals: [...proposals.values()].filter(p => p.agent_ids.includes(agentId)) });
+      } else if (route === "proposals") {
+        if (body) json(proposalFor(body, agentId));
+        else {
+          const proposal = proposals.get(url.searchParams.get("proposal_id"));
+          json(proposal ?? { error: "proposal_not_found", retryable: false }, proposal ? 200 : 404);
+        }
+      } else if (route === "status") {
+        const message = [...sent.values()].find(m => m.id === url.searchParams.get("message_id"));
+        json(message ?? { error: "message_not_found", retryable: false }, message ? 200 : 404);
       } else if (route === "events") {
         res.writeHead(200, { "content-type": "text/event-stream" });
         res.write(`event: ready\ndata: ${JSON.stringify({ agent_id: agentId })}\n\n`);
@@ -57,6 +84,12 @@ async function fixture(t) {
       } else if (route === "send") {
         const prior = sent.get(body.idempotency_key);
         const message = prior ?? { id: randomUUID(), sender_agent_id: agentId, recipient_agent_id: body.recipient_agent_id, group_id: body.group_id, conversation_id: body.conversation_id ?? randomUUID(), reply_to: body.reply_to ?? null, state: "queued", created_at: new Date().toISOString(), expires_at: new Date(Date.now() + 86400000).toISOString(), delivered_at: null, acknowledged_at: null, replied_at: null };
+        if (!prior && (!grouped || holdKind)) {
+          if (!grouped && !body.purpose) { json({ error: "purpose_required", retryable: false }, 400); return; }
+          const proposal = proposalFor(body, agentId);
+          message.state = "held"; message.proposal_id = proposal.id; message.group_id = null;
+          proposal.held_message_ids.push(message.id);
+        }
         sent.set(body.idempotency_key, message);
         if (!lostReply) { lostReply = true; res.destroy(); return; }
         json({ ...message, ...(prior ? { replayed: true } : {}) });
@@ -104,7 +137,7 @@ async function fixture(t) {
     const message = { id: randomUUID(), conversation_id: randomUUID(), group_id: groupId, sender_agent_id: hosted.id, recipient_agent_id: registrations.get(a.client_id).id, reply_to: null, state: "delivered", body: "Please check the parser", sender_label: "Muse", source: "passport_peer", notice: "untrusted", created_at: new Date().toISOString(), expires_at: new Date(Date.now() + 86400000).toISOString() };
     inbox.push(message); return message;
   };
-  return { r, a, b, relay, fetchImpl, hosted, groupId, registrations, seen, inbox, acknowledgements, streams, sent, inbound };
+  return { r, a, b, relay, fetchImpl, proposals, hosted, groupId, registrations, seen, inbox, acknowledgements, streams, sent, inbound };
 }
 
 test("relay registers installations, merges approved peers, stores before ack and deduplicates", async t => {
@@ -115,6 +148,8 @@ test("relay registers installations, merges approved peers, stores before ack an
   assert.equal(f.registrations.get(f.b.client_id).runtime, "codex");
   assert.match(f.registrations.get(f.a.client_id).label, /on test-machine$/);
   const agents = await messageAgents(f.r, f.a, { hostname: "test-machine", fetchImpl: f.fetchImpl });
+  assert.deepEqual(agents.agents[0].shared_group_ids, [f.groupId]);
+  assert.deepEqual(agents.proposals, []);
   assert.equal(agents.local.length, 2); assert.equal(agents.agents[0].id, f.hosted.id); assert.equal(agents.groups.length, 1);
   const remote = f.inbound();
   await f.relay.inbound(registrations.find(a => a.client_id === f.a.client_id));
@@ -200,8 +235,11 @@ test("relinking the same device with a new credential fences the old outbox", as
   const f = await fixture(t);
   await f.relay.register();
   const release = acquireLock(lockPath(f.r.home)); t.after(release);
-  const message = await sendMessage(f.r, { ...f.a, to: "Muse", body: "Review the parser", idempotency_key: randomUUID() }, { fetchImpl: f.fetchImpl });
+  const registration = f.relay.registrations().find(a => a.client_id === f.a.client_id);
   const link = approvedMessagingLink(f.r);
+  const message = f.r.sendMessage({ ...f.a, to: f.hosted.id, body: "Review the parser", idempotency_key: randomUUID() }, {
+    target: { kind: "hosted", ref: f.hosted.id, group_id: f.groupId, sender_id: registration.agent_id, link_key: messagingLinkKey(link) },
+  });
   writeHostedLink(f.r.home, { ...link, credential: `apsd_${"b".repeat(43)}` });
   await f.relay.outbound();
   assert.equal(f.r.messageStatus(message.message_id).last_error, "link_changed");
@@ -322,4 +360,247 @@ for (const inboundFirst of [true, false]) test(`hosted delivery between local in
   const receivedReply = f.r.receiveMessages(f.a).messages[0];
   assert.equal(receivedReply.reply_to, outbound.message_id);
   assert.equal(receivedReply.conversation_id, outbound.conversation_id);
+});
+
+function decide(f, receipt, state) {
+  const message = [...f.sent.values()].find(m => m.id === receipt.hosted_receipt_id);
+  message.state = state;
+  if (state === "queued") message.group_id = f.groupId;
+  Object.assign(f.proposals.get(message.proposal_id), { state: state === "queued" ? "approved" : state, decided_at: new Date().toISOString() });
+  return message;
+}
+
+test("ungrouped discovery requires purpose, stores held receipt and durable options, and keeps local sends local", async t => {
+  const f = await fixture(t, { grouped: false, dropFirst: false });
+  const options = { fetchImpl: f.fetchImpl };
+  const agents = await messageAgents(f.r, f.a, options);
+  assert.deepEqual(agents.agents[0].shared_group_ids, []);
+  assert.equal(agents.agents[0].id, f.hosted.id);
+  assert.deepEqual(agents.groups, []);
+  await assert.rejects(sendMessage(f.r, { ...f.a, to: "Muse", body: "Hello", idempotency_key: randomUUID() }, options), /purpose_required/);
+  assert.equal(f.r.listMessages().length, 0);
+  assert.equal(f.seen.filter(r => r.route === "send").length, 0);
+  const input = { ...f.a, to: "Muse", body: "Review the parser", purpose: "Review parser changes", name: "Parser review", duration_hours: 48, idempotency_key: randomUUID() };
+  const registration = f.relay.registrations().find(a => a.client_id === f.a.client_id);
+  const pending = f.r.sendMessage({ ...input, to: f.hosted.id }, { target: {
+    kind: "hosted", ref: f.hosted.id, group_id: null, sender_id: registration.agent_id,
+    link_key: messagingLinkKey(approvedMessagingLink(f.r)),
+  } });
+  assert.equal(pending.state, "pending");
+  // A fresh relay instance must read the options from the durable outbox.
+  await new MessagingRelay(f.r, options).outbound();
+  const held = f.r.messageStatus(pending.message_id);
+  assert.equal(held.state, "held");
+  assert.ok(held.proposal_id && held.hosted_receipt_id);
+  assert.equal(held.hosted_group_id, null);
+  assert.equal(held.send_options, undefined);
+  const sent = f.seen.find(r => r.route === "send");
+  assert.equal(sent.body.purpose, input.purpose);
+  assert.equal(sent.body.name, input.name);
+  assert.equal(sent.body.duration_hours, 48);
+  assert.equal(sent.body.group_id, undefined);
+  const replay = await sendMessage(f.r, input, options);
+  assert.equal(replay.message_id, held.message_id);
+  assert.match(replay.notice, /owner must approve.*Passport Inbox/);
+  await assert.rejects(sendMessage(f.r, { ...input, purpose: "Different purpose" }, options), /idempotency_conflict/);
+  const status = await refreshMessagingStatus(f.r, options);
+  assert.equal(status.held[0].proposal_id, held.proposal_id);
+  assert.equal(status.proposals[0].id, held.proposal_id);
+  assert.equal(f.r.listMessages()[0].state, "held");
+  assert.equal((await messageAgents(f.r, f.a, options)).proposals[0].id, held.proposal_id);
+  const local = await sendMessage(f.r, { ...f.a, to: f.b.client_id, body: "Local review", idempotency_key: randomUUID() }, options);
+  assert.equal(local.state, "pending"); assert.equal(local.proposal_id, null);
+  assert.equal(f.sent.size, 1);
+});
+
+for (const state of ["queued", "denied", "expired"]) test(`sender events reconcile held messages after ${state}`, async t => {
+  const f = await fixture(t, { grouped: false, dropFirst: false });
+  const options = { fetchImpl: f.fetchImpl };
+  const held = await sendMessage(f.r, { ...f.a, to: "Muse", body: "Review the parser", purpose: "Parser review", idempotency_key: randomUUID() }, options);
+  assert.equal(held.state, "held");
+  const registration = f.relay.registrations().find(r => r.client_id === f.a.client_id);
+  const controller = new AbortController();
+  const running = f.relay.stream(registration, controller.signal);
+  try {
+    for (let i = 0; i < 100 && !f.streams.has(registration.agent_id); i++) await delay(10);
+    const remote = decide(f, held, state);
+    const stream = f.streams.get(registration.agent_id);
+    assert.ok(stream);
+    stream.write(`event: message\ndata: ${JSON.stringify({ message_id: remote.id, state })}\n\n`);
+    for (let i = 0; i < 100 && f.r.messageStatus(held.message_id).state === "held"; i++) await delay(10);
+    const result = f.r.messageStatus(held.message_id);
+    assert.equal(result.state, state === "queued" ? "delivered" : "expired");
+    assert.equal(result.last_error, state === "denied" ? "denied" : null);
+    assert.equal(result.proposal_id, held.proposal_id);
+    if (state === "queued") assert.equal(result.hosted_group_id, f.groupId);
+    else assert.equal(f.r.db.prepare("SELECT 1 FROM content_records WHERE entity_id=?").get(held.message_id), undefined);
+    assert.ok(f.seen.some(r => r.route === "status" && r.agentId === registration.agent_id));
+    await f.relay.reconcileHeld(registration);
+    assert.equal(f.r.events().filter(e => e.entity_id === held.message_id && e.op === (state === "queued" ? "message_delivered" : "message_expired")).length, 1);
+  } finally { controller.abort(); await running; }
+});
+
+test("held reconciliation recovers without an event, including after local receipt TTL", async t => {
+  const f = await fixture(t, { grouped: false, dropFirst: false });
+  const held = await sendMessage(f.r, { ...f.a, to: "Muse", body: "Review", purpose: "Parser review", idempotency_key: randomUUID() }, { fetchImpl: f.fetchImpl });
+  decide(f, held, "denied");
+  f.r.db.prepare("UPDATE messages SET expires_at='2000-01-01' WHERE message_id=?").run(held.message_id);
+  f.r.expireMessages();
+  assert.equal(f.r.messageStatus(held.message_id).state, "held");
+  assert.equal(f.r.db.prepare("SELECT 1 FROM content_records WHERE entity_id=?").get(held.message_id), undefined);
+  await f.relay.reconcileHeld(f.relay.registrations().find(r => r.client_id === f.a.client_id));
+  assert.equal(f.r.messageStatus(held.message_id).last_error, "denied");
+});
+
+test("explicit create, renewal, continuation and status use the sending client's agent id", async t => {
+  const f = await fixture(t, { grouped: false, dropFirst: false });
+  const options = { fetchImpl: f.fetchImpl };
+  const input = { ...f.b, peer_agent_ids: [f.hosted.id], purpose: "Review changes", name: "Review", project_boundary: "Parser", duration_hours: 72 };
+  const proposal = await proposeCollaboration(f.r, input, options);
+  assert.equal(proposal.kind, "create");
+  assert.equal(proposal.state, "pending");
+  assert.equal(proposal.duration_hours, 72);
+  assert.match(proposal.notice, /owner must approve/);
+  const sender = f.registrations.get(f.b.client_id).id;
+  assert.deepEqual(proposal.agent_ids, [sender, f.hosted.id]);
+  const post = f.seen.find(r => r.route === "proposals" && r.body);
+  assert.equal(post.body.agent_id, sender);
+  assert.equal(post.body.client_secret, undefined);
+  assert.equal(post.body.project_boundary, "Parser");
+  assert.equal((await proposeCollaboration(f.r, input, options)).replayed, true);
+  const fetched = await proposalStatus(f.r, { ...f.b, proposal_id: proposal.id }, options);
+  assert.equal(fetched.id, proposal.id);
+  assert.equal(f.seen.at(-1).agentId, sender);
+  await proposalStatus(f.r, { proposal_id: proposal.id }, { ...options, owner: true });
+  assert.equal(f.seen.at(-1).agentId, sender);
+  const ownerProposal = await proposeCollaboration(f.r, { to: f.registrations.get(f.a.client_id).id, purpose: "Review" }, { ...options, owner: true });
+  assert.equal(ownerProposal.agent_ids.length, 2);
+  assert.notEqual(ownerProposal.proposer_agent_id, f.registrations.get(f.a.client_id).id);
+  const renew = await proposeCollaboration(f.r, { ...f.b, kind: "renew", group_id: f.groupId, duration_hours: 24 }, options);
+  assert.equal(renew.group_id, f.groupId);
+  const conversation = randomUUID();
+  const continuation = await proposeCollaboration(f.r, { ...f.b, kind: "continue", conversation_id: conversation }, options);
+  assert.equal(continuation.conversation_id, conversation);
+  for (const duration_hours of [0, 721, 1.5]) await assert.rejects(proposeCollaboration(f.r, { ...input, duration_hours }, options), /invalid duration/);
+  const calls = f.seen.length;
+  f.r.revokeClient(f.b.client_id);
+  await assert.rejects(proposalStatus(f.r, { ...f.b, proposal_id: proposal.id }, options), /authentication/);
+  assert.equal(f.seen.length, calls);
+});
+
+for (const kind of ["renew", "continue"]) test(`grouped sends can be held for ${kind}`, async t => {
+  const f = await fixture(t, { dropFirst: false, holdKind: kind });
+  const held = await sendMessage(f.r, { ...f.a, to: "Muse", body: "Review", idempotency_key: randomUUID() }, { fetchImpl: f.fetchImpl });
+  assert.equal(held.state, "held");
+  assert.equal(held.hosted_group_id, null);
+  assert.equal(f.proposals.get(held.proposal_id).kind, kind);
+  decide(f, held, "queued");
+  await f.relay.reconcileHeld(f.relay.registrations().find(r => r.client_id === f.a.client_id));
+  assert.equal(f.r.messageStatus(held.message_id).state, "delivered");
+});
+
+
+test("send returns a held receipt even with a running relay lock", async t => {
+  const f = await fixture(t, { grouped: false, dropFirst: false });
+  const release = acquireLock(lockPath(f.r.home)); t.after(release);
+  const held = await sendMessage(f.r, { ...f.a, to: "Muse", body: "Review", purpose: "Parser review", idempotency_key: randomUUID() }, { fetchImpl: f.fetchImpl });
+  assert.equal(held.state, "held"); assert.ok(held.proposal_id);
+  assert.match(held.notice, /owner must approve/);
+  const sends = f.seen.filter(r => r.route === "send").length;
+  await f.relay.outbound();
+  assert.equal(f.seen.filter(r => r.route === "send").length, sends);
+  f.r.revokeClient(f.a.client_id);
+  assert.equal(f.r.messageStatus(held.message_id).state, "expired");
+  assert.equal(f.r.db.prepare("SELECT 1 FROM content_records WHERE entity_id=?").get(held.message_id), undefined);
+});
+
+for (const kind of ["renew", "continue"]) for (const state of ["denied", "expired"]) test(`lost grouped ${kind} response replays after proposal ${state}`, async t => {
+  const f = await fixture(t, { holdKind: kind });
+  const key = randomUUID();
+  const pending = await sendMessage(f.r, { ...f.a, to: "Muse", body: "Review", idempotency_key: key }, { fetchImpl: f.fetchImpl });
+  assert.equal(pending.state, "pending");
+  assert.equal(pending.hosted_group_id, f.groupId);
+  assert.equal(pending.hosted_receipt_id, null);
+  const hosted = f.sent.get(key);
+  assert.equal(hosted.state, "held");
+  decide(f, { hosted_receipt_id: hosted.id }, state);
+  assert.equal(hosted.group_id, null);
+  f.r.db.prepare("UPDATE messages SET retry_at = NULL WHERE message_id = ?").run(pending.message_id);
+  await f.relay.outbound();
+  const result = f.r.messageStatus(pending.message_id);
+  assert.equal(result.state, "expired");
+  assert.equal(result.last_error, state === "denied" ? "denied" : null);
+  assert.equal(result.hosted_receipt_id, hosted.id);
+  assert.equal(result.proposal_id, hosted.proposal_id);
+  assert.equal(f.r.db.prepare("SELECT 1 FROM content_records WHERE entity_id = ?").get(pending.message_id), undefined);
+  await f.relay.outbound();
+  f.r.expireMessages();
+  assert.equal(f.seen.filter(r => r.route === "send").length, 2);
+  assert.equal(f.r.events().filter(e => e.entity_id === pending.message_id && e.op === "message_expired").length, 1);
+});
+
+for (const field of ["sender_agent_id", "recipient_agent_id", "id", "group_id", "proposal_id", "state"]) test(`terminal replay still validates ${field}`, async t => {
+  const f = await fixture(t, { holdKind: "renew" });
+  const key = randomUUID();
+  const pending = await sendMessage(f.r, { ...f.a, to: "Muse", body: "Review", idempotency_key: key }, { fetchImpl: f.fetchImpl });
+  const hosted = f.sent.get(key);
+  decide(f, { hosted_receipt_id: hosted.id }, "denied");
+  // A concurrently recorded receipt must also retain its identity on replay.
+  if (field === "id") f.r.db.prepare("UPDATE messages SET hosted_receipt_id = ? WHERE message_id = ?").run(hosted.id, pending.message_id);
+  hosted[field] = field === "state" ? "queued" : field === "proposal_id" ? null : randomUUID();
+  f.r.db.prepare("UPDATE messages SET retry_at = NULL WHERE message_id = ?").run(pending.message_id);
+  await f.relay.outbound();
+  const result = f.r.messageStatus(pending.message_id);
+  assert.equal(result.state, "pending");
+  assert.equal(result.last_error, "invalid_response");
+  assert.ok(f.r.db.prepare("SELECT 1 FROM content_records WHERE entity_id = ?").get(pending.message_id));
+  assert.equal(f.r.events().filter(e => e.entity_id === pending.message_id && e.op === "message_expired").length, 0);
+});
+
+for (const source of ["proposal", "outbound", "inbound"]) test(`owner renews an expired group using retained ${source} membership`, async t => {
+  const f = await fixture(t, { grouped: false, dropFirst: false });
+  await f.relay.register();
+  const sender = f.registrations.get(f.b.client_id).id;
+  const key = messagingLinkKey(approvedMessagingLink(f.r));
+  if (source === "proposal") {
+    f.relay.cacheProposal({ id: randomUUID(), kind: "create", state: "approved", group_id: f.groupId,
+      proposer_agent_id: sender, agent_ids: [sender, f.hosted.id], decided_at: "2000-01-01" });
+  } else if (source === "outbound") {
+    const row = f.r.sendMessage({ ...f.b, to: f.hosted.id, body: "Review", idempotency_key: randomUUID() }, {
+      target: { kind: "hosted", ref: f.hosted.id, group_id: f.groupId, sender_id: sender, link_key: key },
+    });
+    f.r.db.prepare("UPDATE messages SET expires_at = '2000-01-01' WHERE message_id = ?").run(row.message_id);
+    f.r.expireMessages();
+  } else {
+    f.r.acceptHostedMessage(f.b.client_id, { ...f.inbound(), recipient_agent_id: sender }, key);
+  }
+  const fetchImpl = async (url, init) => {
+    if (url.endsWith("/proposals") && init.body) assert.equal(JSON.parse(init.body).agent_id, sender);
+    return f.fetchImpl(url, init);
+  };
+  const proposal = await proposeCollaboration(f.r, { kind: "renew", group_id: f.groupId }, { owner: true, fetchImpl });
+  assert.equal(proposal.proposer_agent_id, sender);
+  assert.equal(proposal.group_id, f.groupId);
+  assert.equal(f.seen.filter(r => r.route === "proposals" && r.body).length, 1);
+});
+
+test("owner renewal requires an explicit installation when membership is unknown or belongs to an old link", async t => {
+  const f = await fixture(t, { grouped: false, dropFirst: false });
+  await f.relay.register();
+  const sender = f.registrations.get(f.b.client_id).id;
+  const input = { kind: "renew", group_id: f.groupId };
+  const options = { owner: true, fetchImpl: f.fetchImpl };
+  await assert.rejects(proposeCollaboration(f.r, input, options), /Cannot determine.*--from <client_id>/);
+  f.relay.cacheProposal({ id: randomUUID(), kind: "create", state: "approved", group_id: f.groupId, agent_ids: [sender, f.hosted.id] });
+  f.r.db.prepare("UPDATE messaging_proposals SET link_key = 'old-link'").run();
+  f.r.sendMessage({ ...f.b, to: f.hosted.id, body: "Review", idempotency_key: randomUUID() }, {
+    target: { kind: "hosted", ref: f.hosted.id, group_id: f.groupId, sender_id: sender, link_key: "old-link" },
+  });
+  await assert.rejects(proposeCollaboration(f.r, input, options), /Cannot determine.*--from <client_id>/);
+  await assert.rejects(proposeCollaboration(f.r, { ...input, client_id: "unknown" }, options), /--from must name an active local client_id/);
+  assert.equal(f.seen.filter(r => r.route === "proposals" && r.body).length, 0);
+  const proposal = await proposeCollaboration(f.r, { ...input, client_id: f.b.client_id }, options);
+  assert.equal(proposal.proposer_agent_id, sender);
+  f.r.revokeClient(f.b.client_id);
+  await assert.rejects(proposeCollaboration(f.r, { ...input, client_id: f.b.client_id }, options), /--from must name an active local client_id/);
 });

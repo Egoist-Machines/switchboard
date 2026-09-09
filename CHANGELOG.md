@@ -2,10 +2,14 @@
 
 ## 0.3.0
 
+- Discover every hosted agent of the owner and propose collaborations, renewals, or continuations from the CLI, Claude channel, and OpenCode tools.
+- Hold messages until the owner approves in Passport Inbox on web or iOS, with a push notification. Track approval, denial, and expiry through relay events and status reconciliation.
+- Migrate schema 10 to 11 while preserving messages, bodies, events, and hosted receipts.
+
 - Add local messages between paired clients with screened bodies in the existing content store, atomic inbox claims, expiry, and content-free receipts.
 - Reuse approved Passport device links for hosted registration, peer discovery, and a singleton relay with SSE reconciliation and an idempotent outbox.
 - Add Claude Code channel delivery, OpenCode push and messaging tools, and prompt inboxes for Claude Code, Codex, and Cursor.
-- Add reversible Claude MCP installation, messaging controls and CLI contracts, and schema version 10 migration.
+- Add reversible Claude MCP installation, messaging controls and CLI contracts, and schema version 11 migration.
 - Remove the separate Passport messaging package integration. Bump the OpenCode plugin to 0.1.3.
 
 

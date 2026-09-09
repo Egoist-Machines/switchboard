@@ -405,11 +405,11 @@ The request requires string `client_id` and `client_secret` values. Optional `pr
 
 ### Message JSON contract
 
-All requests are one JSON object on stdin. All four public commands require `client_id` and `client_secret`, use paired-client authentication, and honor `config messaging off`. No memory grant is required. Valid invocations exit 0 and return JSON. Malformed JSON exits 2. Messaging refusals return `{ "status": "error", "error": "<code>" }`; codes include `unauthorized`, `messaging_disabled`, `message_content_refused`, `message_not_found`, `message_not_received`, `idempotency_conflict`, `invalid_request`, and `unavailable`. A store-open failure returns `{ "status": "unavailable" }`.
+All requests are one JSON object on stdin. All public machine commands require `client_id` and `client_secret`, use paired-client authentication, and honor `config messaging off`. No memory grant is required. Valid invocations exit 0 and return JSON. Malformed JSON exits 2. Messaging refusals return `{ "status": "error", "error": "<code>" }`; codes include `unauthorized`, `messaging_disabled`, `message_content_refused`, `message_not_found`, `message_not_received`, `idempotency_conflict`, `purpose_required`, `proposal_not_found`, `invalid_request`, and `unavailable`. A store-open failure returns `{ "status": "unavailable" }`.
 
 ```sh
 switchboard message-send --json
-# {"client_id":"...","client_secret":"...","to":"client UUID or hosted agent ID or label","reply_to":"optional local message UUID","body":"Message text","idempotency_key":"UUID"}
+# {"client_id":"...","client_secret":"...","to":"client UUID or hosted agent ID or label","reply_to":"optional local message UUID","body":"Message text","purpose":"Why collaborate, required without a shared group","name":"Optional group name","duration_hours":168,"idempotency_key":"UUID"}
 
 switchboard message-receive --json
 # {"client_id":"...","client_secret":"...","limit":10,"wait_ms":30000}
@@ -425,7 +425,7 @@ switchboard message-agents --json
 
 `message-receive` returns `{ "status": "ok", "messages": [...] }`. Each entry contains content-free metadata plus an `envelope` string, with no separate raw body field. The default limit is 10, allowed range 1 to 10. `wait_ms` defaults to 0, polls every 500 milliseconds, and is capped at 30,000 milliseconds. It atomically changes returned messages from `pending` to `notified`, so concurrent receivers cannot claim the same row. A notified message stays claimed until acknowledged or expired. Agents should acknowledge after accepting it. Crashes between claim and acceptance can require recovery with the adapter command described below.
 
-`message-ack` changes a claimed message to `delivered` and returns its content-free metadata. Repeated acknowledgements are idempotent, and only the addressed client may acknowledge. `message-agents` returns `{ "status": "ok", "local": [...], "agents": [...], "groups": [...] }`. Hosted discovery failure retains the local results and returns `status: "hosted_unavailable"`.
+`message-ack` changes a claimed message to `delivered` and returns its content-free metadata. Repeated acknowledgements are idempotent, and only the addressed client may acknowledge. `message-agents` returns `{ "status": "ok", "local": [...], "agents": [...], "groups": [...], "proposals": [...] }`. Hosted discovery failure retains the local results and returns `status: "hosted_unavailable"`.
 
 Adapters also use `message-release --json` with credentials and `message_id` to return a failed delivery claim to `pending`, and `message-relay-start --json` with credentials to start the linked relay. `message-receive` accepts optional `max_chars` from 0 to 32,000 to leave messages pending when their complete envelope exceeds an adapter's budget.
 
@@ -448,9 +448,9 @@ Switchboard does not store recall queries. Events store a keyed project fingerpr
 
 ## Upgrading
 
-Switchboard checks and migrates the schema whenever it opens the store. Versions 4 and 5 migrate through version 6, version 6 migrates through version 7, and version 7 migrates through version 8. Version 8 gains the local message tables and lifecycle event constraints. Version 9 stores gain separate hosted receipt IDs. Both upgrade to version 10. The version 5-to-6 migration expires pending project-scoped hand-offs because old scope values cannot be converted safely, but it preserves pending unscoped hand-offs. The version 7-to-8 migration retains the old replica scope key. It adds the hosted owner scope key only after an approved link delivers it.
+Switchboard checks and migrates the schema whenever it opens the store. Versions 4 and 5 migrate through version 6, version 6 migrates through version 7, and version 7 migrates through version 8. Version 8 gains the local message tables and lifecycle event constraints. Version 9 stores gain separate hosted receipt IDs. Version 10 adds held-message support and proposal metadata. All upgrade to version 11. The version 5-to-6 migration expires pending project-scoped hand-offs because old scope values cannot be converted safely, but it preserves pending unscoped hand-offs. The version 7-to-8 migration retains the old replica scope key. It adds the hosted owner scope key only after an approved link delivers it.
 
-The version 10 migration is forward-only, like the earlier schema bumps. It separates outbound hosted receipt IDs from inbound message IDs while preserving existing messages, content, and events. Before upgrading, stop Switchboard and copy the entire Switchboard home directory (by default `~/.switchboard`) to a private backup location. That directory contains the database and the local keys needed to interpret its keyed identifiers. The single-writer guidance still applies: do not intentionally open one store from concurrent Switchboard processes during the upgrade. If another process nevertheless reaches the guarded upgrade while the writer holds it, bounded contention handling returns a retryable unavailable outcome rather than partially applying or corrupting the migration. After a schema version 10 binary opens the store, older binaries refuse it; restore the copied directory before running the older binary instead of trying to downgrade the live store.
+The migrations to versions 10 and 11 are forward-only, like the earlier schema bumps. Version 10 separates outbound hosted receipt IDs from inbound message IDs. Version 11 adds `held` to the message states, a `proposal_id`, durable send options, and a proposal cache. Both preserve existing messages, content, and events. Before upgrading, stop Switchboard and copy the entire Switchboard home directory (by default `~/.switchboard`) to a private backup location. That directory contains the database and the local keys needed to interpret its keyed identifiers. The single-writer guidance still applies: do not intentionally open one store from concurrent Switchboard processes during the upgrade. If another process nevertheless reaches the guarded upgrade while the writer holds it, bounded contention handling returns a retryable unavailable outcome rather than partially applying or corrupting the migration. After a schema version 11 binary opens the store, older binaries refuse it; restore the copied directory before running the older binary instead of trying to downgrade the live store.
 
 Other unsupported schema versions fail closed. Keep the pre-upgrade directory copy until the upgraded binary and sync flow have been verified.
 
@@ -697,7 +697,7 @@ switchboard config messaging off
 switchboard config messaging on
 ```
 
-`message list` shows up to 100 pending and recent content-free receipts. `status` includes a one-line messaging summary. `messaging status` returns JSON with the link state, relay state, registered agents, pending count, `failure_count`, and content-free failures. Pending counts include pending and notified rows across the full store. Failure counts and details also cover the full store, regardless of receipt age. Disable messaging to stop sends, receives, acknowledgements, registration, and relay requests. Memory access continues under its existing grants.
+`message list` shows up to 100 pending and recent content-free receipts. `status` includes a one-line messaging summary. `messaging status` returns JSON with the link state, relay state, registered agents, pending count, `held` rows, pending `proposals`, `failure_count`, and content-free failures. Pending counts include pending and notified rows across the full store. Failure counts and details also cover the full store, regardless of receipt age. Disable messaging to stop sends, receives, acknowledgements, registration, and relay requests. Memory access continues under its existing grants.
 
 Bodies use the existing `content_records` codec and content screening. Messages expire after 24 hours by default; expiry deletes the body and keeps a content-free receipt. Revoking a client immediately expires its pending sends, deletes their bodies, and records `message_expired` events. Receives exclude revoked senders before selecting the 50 candidates, so older pending rows from those senders cannot block valid mail. The event log records `message_created`, `message_delivered`, and `message_expired`. Memory sync does not upload message bodies or replay message lifecycle events.
 
@@ -709,16 +709,46 @@ Link the store once with `switchboard link`. The approved device credential also
 switchboard link
 switchboard sync
 switchboard message agents
-switchboard message send --to "Muse" "Please review the parser changes."
+switchboard message send --to "Muse" --purpose "Review parser changes together" "Please review the parser changes."
 switchboard messaging status
 switchboard messaging relay
 ```
 
-The relay registers each paired, unrevoked client as a device agent with a label such as `Claude Code coding install on my-laptop`. After registration, approve a collaboration group at [your Passport assistants page](https://my.ego.ist/assistants). Hosted peer discovery includes only agents that Passport returns for active owner-approved groups. `message agents` merges those peers and groups with paired local clients. An ambiguous hosted label is refused with the matching agent IDs; use an exact ID to choose. Owner CLI sends use a registered local installation that shares a group with the recipient. Machine sends always use the authenticated client's installation. When several groups are eligible for a new conversation, Switchboard uses the first eligible group returned by Passport. Replies retain their original group and conversation.
+The relay registers each paired, unrevoked client as a device agent with a label such as `Claude Code coding install on my-laptop`. `message agents` lists every other hosted agent belonging to the owner, its `shared_group_ids` (possibly empty), active groups, and pending or recently decided proposals. It also lists paired local clients. An ambiguous hosted label is refused with the matching agent IDs; use an exact ID to choose. Machine sends always use the authenticated client's installation. Owner sends prefer a registered installation with a shared active group, or use the first available installation to propose a collaboration. When several groups are eligible for a new conversation, Switchboard uses the first eligible group returned by Passport. Replies retain their original group and conversation.
+
+Sending to an ungrouped hosted peer requires `--purpose "why these agents should collaborate"`. Machine commands and tools use `purpose`. Without it, the request fails with `purpose_required`. Optional `name` and `duration_hours` describe the requested group. Durations are whole hours from 1 to 720, with 168 hours as the default. Passport stores the message as `held` and creates or reuses a proposal. The receipt includes `proposal_id` and `hosted_receipt_id`; `message list` shows `held`.
+
+The owner approves or denies the request in Passport Inbox on web or iOS. Passport sends a push notification. The owner can edit the name, purpose, or duration before approval. The Inbox shows the requested collaboration and the number of waiting messages, without message text. Approval releases the held messages without resending them. A pending proposal expires after 24 hours. Local-to-local messages need no proposal.
+
+The relay checks held receipts on sender events and every 20 seconds through Passport's status endpoint. Passport `queued` becomes local `delivered`; `denied` becomes local `expired` with `last_error: "denied"`; `expired` becomes local `expired`. Denial and expiry delete the local body. This also applies when the first held response was lost and a retry receives the terminal receipt before any group was approved. Overdue held body copies are deleted once locally while their receipts wait for a confirmed Passport outcome; later sweeps skip bodies already removed. `messaging status` refreshes hosted status and lists held rows and pending proposals. When Passport is unavailable, it uses the cached proposal information. Local `delivered` means Passport accepted the message for delivery, not that the recipient read it.
+
+Propose a collaboration without sending a message:
+
+```sh
+switchboard message propose --to <agent_id>,<agent_id> --purpose "Review this release" --name "Release review" --duration-hours 48
+switchboard message proposal-status <proposal_id>
+switchboard message propose --kind renew --group-id <group_id> --duration-hours 168
+switchboard message propose --kind continue --conversation-id <conversation_id>
+```
+
+`create` is the default kind. The sender is included automatically in the proposed members. Renewal uses `group_id`; continuation uses `conversation_id` to request another 20 messages. Passport also holds sends when renewal or continuation approval is required.
+
+Owner renewal selects a local installation that belongs to the group. Expired groups are absent from active discovery, so Switchboard also checks retained proposals and group-linked message receipts for the current Passport link. If it cannot determine a member, the command asks for `--from <client_id>`. For example, use `switchboard message propose --kind renew --group-id <group_id> --from <client_id>`. Find local client IDs with `switchboard message agents`. The `--from` option selects the sending installation for owner proposals; Passport checks its membership and renewal eligibility.
+
+Machine commands accept paired credentials on stdin:
+
+```sh
+switchboard message-propose --json
+# {"client_id":"...","client_secret":"...","peer_agent_ids":["hosted UUID"],"purpose":"Review this release","name":"Release review","duration_hours":48}
+switchboard message-proposal-status --json
+# {"client_id":"...","client_secret":"...","proposal_id":"proposal UUID"}
+```
+
+`message-propose` returns the Passport proposal with its `id`, `kind`, `state`, members, purpose, duration, and decision timestamps. For renewal or continuation, pass `kind: "renew"` with `group_id`, or `kind: "continue"` with `conversation_id`. Optional `project_boundary` is forwarded to Passport. The relay calls the proposals API using the sending client's registered agent ID.
 
 One relay process runs per store, protected by a pid lock with stale-lock detection. Relay and channel locks publish a complete pid and ownership token atomically. Stale takeover uses an exclusive `.takeover` guard, rechecks the old file's identity and pid record, then atomically replaces it. A competing takeover cannot remove the new owner's lock, and release checks the owner's token. If a process crashes while holding the short-lived guard, takeover stops until that guard is removed with all users of the lock stopped. With a stale lock and a leftover guard, `messaging status` reports `relay: "blocked"` with the `guard` path and `recovery` instructions. Foreground relay startup returns `status: "blocked"` with the same details and makes no network requests. Automatic startup does not spawn a relay while blocked. A live owner is still reported as running. After stopping all users of the lock and removing the guard, normal takeover can resume. Claude's channel, the OpenCode plugin, and `switchboard sync` start it detached when the store is linked and messaging is on. `switchboard messaging relay` runs in the foreground for a service manager such as launchd. It uses the same HTTPS base URL and approved `apsd_` credential as sync. HTTP is allowed only for loopback development servers. Redirects are refused.
 
-The relay subscribes to Passport events, reconciles the inbox every 20 seconds, and acknowledges hosted messages after their bodies have committed to SQLite. Passport supports at most eight concurrent event streams per device credential. Up to eight registered installations have streams; any additional installations receive through the 20-second reconciliation timer. Outbound messages stay in the local outbox and retry with the same UUID idempotency key and bounded backoff. If no relay is running, the sending process attempts the outbox immediately. Status exposes error codes without bodies. Outbox messages are bound to the approved link credential, device, and base URL so relinking cannot send old messages as another device.
+The relay subscribes to Passport events, reconciles the inbox every 20 seconds, and acknowledges hosted messages after their bodies have committed to SQLite. Passport supports at most eight concurrent event streams per device credential. Up to eight registered installations have streams; any additional installations receive through the 20-second reconciliation timer. Outbound messages stay in the local outbox and retry with the same UUID idempotency key and bounded backoff. The sending process attempts its own outbox row immediately so it can return the proposal receipt even when a background relay is running. Concurrent attempts use the same idempotency key. If submission is unavailable, the local receipt stays `pending`; an ungrouped send already explains that owner approval will be needed. Once Passport accepts it for review, the receipt becomes `held`. Status exposes error codes without bodies. Outbox messages are bound to the approved link credential, device, and base URL so relinking cannot send old messages as another device.
 
 Passport's `delivered` receipt means the relay or an MCP host pulled the message. `acknowledged` means the body is durably stored on the owner's device or the MCP host explicitly acknowledged it. `replied` means a reply was sent in the same conversation. A local inbound `delivered` receipt means the host accepted the hook output, channel notification, or OpenCode prompt, or the agent explicitly acknowledged it. A local outbound `delivered` receipt means Passport accepted the send; it is not evidence that the remote host has read it.
 
@@ -732,7 +762,7 @@ During the channel research preview, start Claude with:
 claude --dangerously-load-development-channels server:switchboard
 ```
 
-The server runs `switchboard channel claude` over stdio. It declares `claude/channel` and exposes `passport_send_message`, `passport_list_agents`, and `passport_message_status`. It does not declare the permission-relay capability. A successful notification write counts as delivery to the session. A live per-client channel lock makes the prefetch hook skip that inbox. When no channel process is running, Claude receives its inbox at the next prompt.
+The server runs `switchboard channel claude` over stdio. It declares `claude/channel` and exposes `passport_send_message`, `passport_list_agents`, `passport_message_status`, `passport_propose_collaboration`, and `passport_proposal_status`. It does not declare the permission-relay capability. A successful notification write counts as delivery to the session. A live per-client channel lock makes the prefetch hook skip that inbox. When no channel process is running, Claude receives its inbox at the next prompt.
 
 Uninstall journals the last Claude hook removal and MCP entry removal before each write. A failure restores both files from their recorded snapshots. Interrupted removal is recovered by the next install, uninstall, or `coding doctor`. Recovery refuses to overwrite a file changed by another writer and retains the journal for repair. Unrelated settings and MCP entries remain intact.
 
@@ -742,7 +772,7 @@ The notification fields and preview flag follow the [Claude Code channel referen
 
 The OpenCode plugin starts a local receive loop. It tracks the latest session ID from `event` and `chat.message`, then injects the same untrusted envelope with `client.session.prompt({ path: { id }, body: { parts: [{ type: "text", text: envelope }] } })`. The loop leaves mail pending until a session is known. The existing system transform also includes pending messages in a separate `<ai-passport-messages>` block when a prompt can accept them. Claims are shared between these delivery paths, and failed push calls release their claim. The plugin acknowledges a message only after its prompt or fallback block is accepted.
 
-Use `passport_send_message` with `to`, `body`, `idempotency_key`, and optional `reply_to`. Use `passport_list_agents` to discover recipients. These tools use the local transport and paired credentials. Plugin disposal stops the receive loop. The integration is checked against the installed `@opencode-ai/plugin` and SDK version 1.18.22 types and fake-client tests.
+Use `passport_send_message` with `to`, `body`, `idempotency_key`, and optional `reply_to`, `purpose`, `name`, and `duration_hours`. A held result explains that the owner must approve in Passport Inbox. Use `passport_propose_collaboration` with optional `kind` (default `create`), `peer_agent_ids`, `name`, `purpose`, `project_boundary`, `duration_hours`, `group_id`, and `conversation_id`. Use `passport_proposal_status` with `proposal_id` to read the decision. Claude exposes the same proposal tools and send options. Use `passport_list_agents` to discover recipients. These tools use the local transport and paired credentials. Plugin disposal stops the receive loop. The integration is checked against the installed `@opencode-ai/plugin` and SDK version 1.18.22 types and fake-client tests.
 
 ## Codex and Cursor inbox
 
