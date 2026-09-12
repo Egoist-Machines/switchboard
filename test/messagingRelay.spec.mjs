@@ -14,7 +14,7 @@ import { receiveMessages, acquireLock, lockPath, LockBlockedError } from "../src
 import { writeHostedLink, forgetHostedLink } from "../src/hostedLink.js";
 import { temporaryHome } from "./helpers.mjs";
 
-async function fixture(t, { grouped = true, dropFirst = true, holdKind = null, cap = 3, sendError = null, excludedClients = [] } = {}) {
+async function fixture(t, { grouped = true, dropFirst = true, holdKind = null, cap = 3, sendError = null, proposalError = null, excludedClients = [] } = {}) {
   const r = new LocalRepository({ home: temporaryHome(t) });
   t.after(() => r.close());
   const a = r.addClient({ host: "claude-code", label: "Claude" });
@@ -63,6 +63,7 @@ async function fixture(t, { grouped = true, dropFirst = true, holdKind = null, c
           groups: grouped ? [{ id: groupId, name: "Review", purpose: "Review code", agent_ids: members(), expires_at: new Date(Date.now() + 86400000).toISOString() }] : [],
           proposals: [...proposals.values()].filter(p => p.agent_ids.includes(agentId)) });
       } else if (route === "proposals") {
+        if (proposalError) { const error = proposalError; proposalError = null; json({ error, retryable: false }, 404); return; }
         if (body) json(proposalFor(body, agentId));
         else {
           const proposal = proposals.get(url.searchParams.get("proposal_id"));
@@ -636,6 +637,29 @@ test("explicit create, renewal, continuation and status use the sending client's
   assert.equal(f.seen.length, calls);
 });
 
+for (const action of [proposeCollaboration, proposalStatus]) for (const error of ["agent_not_found", "agent_revoked"]) test(`${action.name} ${error} forgets only the selected registration and registers it next time`, async t => {
+  const f = await fixture(t, { proposalError: error });
+  await f.relay.register();
+  const other = f.relay.registrations().find(r => r.client_id === f.a.client_id);
+  const sender = f.registrations.get(f.b.client_id).id, id = randomUUID();
+  f.proposals.set(id, { id, state: "pending", proposer_agent_id: sender, agent_ids: [sender, f.hosted.id] });
+  const input = action === proposalStatus ? { ...f.b, proposal_id: id } : { ...f.b, to: f.hosted.id, purpose: "Review" };
+  const options = { hostname: "test-machine", fetchImpl: f.fetchImpl };
+  await assert.rejects(action(f.r, input, options), { message: error, retryable: false });
+  assert.equal(f.seen.filter(r => r.route === "register").length, 2);
+  assert.equal(f.seen.filter(r => r.route === "proposals").length, 1);
+  assert.equal(f.seen.at(-1).agentId, sender);
+  assert.equal(f.r.db.prepare("SELECT 1 FROM messaging_agents WHERE client_id=?").get(f.b.client_id), undefined);
+  assert.deepEqual(f.relay.registrations(), [other]);
+  const proposal = await action(f.r, input, options);
+  assert.equal(proposal.state, "pending");
+  if (action === proposalStatus) assert.equal(proposal.id, id);
+  const calls = f.seen.filter(r => r.route === "register");
+  assert.equal(calls.length, 3); assert.equal(calls.at(-1).body.installation, f.b.client_id);
+  assert.equal(f.relay.registrations().find(r => r.client_id === f.b.client_id).agent_id, sender);
+  assert.deepEqual(f.relay.registrations().find(r => r.client_id === f.a.client_id), other);
+});
+
 for (const kind of ["renew", "continue"]) test(`grouped sends can be held for ${kind}`, async t => {
   const f = await fixture(t, { dropFirst: false, holdKind: kind });
   const held = await sendMessage(f.r, { ...f.a, to: "Muse", body: "Review", idempotency_key: randomUUID() }, { fetchImpl: f.fetchImpl });
@@ -782,6 +806,7 @@ test("group posts fan out, thread replies omit recipients and link through copie
   const received = (await receiveMessages(f.r, f.b)).messages[0];
   assert.equal(received.conversation_kind, "group"); assert.equal(received.hosted_post_id, post.hosted_post_id);
   assert.equal(received.conversation_id, post.conversation_id);
+  assert.throws(() => f.r.postStatus(post.hosted_post_id, f.b), /message_not_found/);
   assert.match(received.envelope, /kind="group"/); assert.match(received.envelope, /reply reaches every member of the thread/);
   assert.equal(received.body, undefined);
   const replyInput = { ...f.b, reply_to: received.message_id, body: "Reviewed", idempotency_key: randomUUID() };
@@ -812,6 +837,24 @@ test("group posts fan out, thread replies omit recipients and link through copie
   await assert.rejects(sendMessage(f.r, { ...f.a, conversation_id: randomUUID(), body: "Unknown", idempotency_key: randomUUID() }, options), /conversation_not_found/);
   await assert.rejects(f.relay.request("send", { agentId: a.agent_id, body: { recipient_agent_id: b.agent_id, conversation_id: post.hosted_conversation_id } }), /conversation_unavailable/);
   for (const value of [post, f.r.listMessages(), messagingStatus(f.r), f.r.events().filter(e => e.op.startsWith("message_"))]) assert.doesNotMatch(JSON.stringify(value), /Group review|Reviewed|More review/);
+});
+
+test("post status belongs to the sending client after registration eviction and replacement", async t => {
+  const f = await fixture(t, { dropFirst: false });
+  const options = { hostname: "test-machine", fetchImpl: f.fetchImpl };
+  const post = await sendMessage(f.r, { ...f.a, group_id: f.groupId, body: "Review", idempotency_key: randomUUID() }, options);
+  f.r.db.prepare("DELETE FROM messaging_agents WHERE client_id=?").run(f.a.client_id);
+  assert.equal(f.r.postStatus(post.hosted_post_id, f.a).message_id, post.message_id);
+  assert.throws(() => f.r.postStatus(post.hosted_post_id, f.b), /message_not_found/);
+  f.registrations.delete(f.a.client_id);
+  await f.relay.register();
+  assert.notEqual(f.registrations.get(f.a.client_id).id, post.hosted_sender_id);
+  assert.equal(f.r.postStatus(post.hosted_post_id, f.a).message_id, post.message_id);
+  assert.throws(() => f.r.postStatus(post.hosted_post_id, f.b), /message_not_found/);
+  const owner = await sendMessage(f.r, { client_id: f.a.client_id, group_id: f.groupId, body: "Owner review", idempotency_key: randomUUID() }, { ...options, owner: true });
+  assert.equal(owner.from_kind, "owner");
+  assert.equal(owner.hosted_sender_id, f.registrations.get(f.a.client_id).id);
+  for (const client of [f.a, f.b]) assert.throws(() => f.r.postStatus(owner.hosted_post_id, client), /message_not_found/);
 });
 
 test("group selectors preserve the conversation and refuse a conflicting local group before discovery", async t => {

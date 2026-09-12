@@ -501,7 +501,9 @@ export async function proposeCollaboration(repository, input, { owner = false, .
     throw new Error("invalid proposal target");
   }
   repository.requireMessagingClient(input, { owner });
-  const proposal = await relay.request("proposals", { agentId: registration.agent_id, body });
+  const proposal = await relay.request("proposals", { agentId: registration.agent_id, body }).catch(error => {
+    relay.forgetRegistration(registration.agent_id, error); throw error;
+  });
   repository.requireMessagingClient(input, { owner });
   relay.cacheProposal(proposal);
   return withApprovalNotice(proposal);
@@ -515,7 +517,9 @@ export async function proposalStatus(repository, input, { owner = false, ...opti
   const proposer = cached ? JSON.parse(cached.payload).proposer_agent_id : null;
   const registration = (owner && registrations.find(r => r.agent_id === proposer)) || registrations.find(r => owner || r.client_id === input.client_id);
   if (!registration) throw new Error("agent_required");
-  const proposal = await relay.request(`proposals?proposal_id=${encodeURIComponent(input.proposal_id)}`, { agentId: registration.agent_id });
+  const proposal = await relay.request(`proposals?proposal_id=${encodeURIComponent(input.proposal_id)}`, { agentId: registration.agent_id }).catch(error => {
+    relay.forgetRegistration(registration.agent_id, error); throw error;
+  });
   repository.requireMessagingClient(input, { owner });
   relay.cacheProposal(proposal);
   return withApprovalNotice(proposal);

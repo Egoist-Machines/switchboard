@@ -2622,8 +2622,8 @@ export class LocalRepository {
   postStatus(postId, input) {
     const client = this.requireMessagingClient(input);
     requireUuid(postId, "post_id");
-    const row = this.db.prepare(`SELECT m.message_id FROM messages m JOIN messaging_agents a ON a.agent_id = m.hosted_sender_id AND a.link_key = m.link_key
-      WHERE m.origin = 'local' AND m.hosted_post_id = ? AND a.client_id = ?`).get(postId, client.client_id);
+    const row = this.db.prepare(`SELECT message_id FROM messages WHERE origin = 'local' AND hosted_post_id = ?
+      AND from_kind = 'client' AND from_ref = ?`).get(postId, client.client_id);
     if (!row) throw new Error("message_not_found");
     return this.messageStatus(row.message_id);
   }
