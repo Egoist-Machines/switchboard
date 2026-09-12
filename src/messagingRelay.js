@@ -18,9 +18,12 @@ const ERROR_CODES = new Set([
   "messaging_disabled", "message_content_refused", "group_required", "group_not_found", "group_expired",
   "group_revoked", "group_not_approved", "not_authorized", "forbidden", "agent_not_found", "agent_revoked",
   "recipient_not_found", "conversation_not_found", "conversation_mismatch", "continuation_required",
+  "conversation_capped", "conversation_unavailable", "group_unauthorized", "queue_full", "recipient_unavailable",
+  "invalid_reply", "message_unavailable", "content_rejected", "not_found",
   "purpose_required", "proposal_not_found", "proposal_limit",
   "idempotency_conflict", "rate_limited", "invalid_request", "unauthorized", "invalid_group",
 ]);
+const isUuid = value => typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
 const errorCode = error => ERROR_CODES.has(error?.message) ? error.message : "unavailable";
 
 export class MessagingRelay {
@@ -37,7 +40,7 @@ export class MessagingRelay {
     if (!link) throw new Error("messaging_unlinked_or_disabled");
     return link;
   }
-  async request(route, { agentId, body, signal = this.signal, stream = false } = {}) {
+  async request(route, { agentId, body, signal = this.signal, stream = false, timeoutMs = 10000 } = {}) {
     const link = this.link();
     const url = new URL(`${link.base_url}/messaging/v1/${route}`);
     if (agentId && body === undefined) url.searchParams.set("agent_id", agentId);
@@ -45,25 +48,39 @@ export class MessagingRelay {
       method: body === undefined ? "GET" : "POST", redirect: "error",
       headers: { authorization: `Bearer ${link.credential}`, ...(body === undefined ? {} : { "content-type": "application/json" }) },
       ...(body === undefined ? {} : { body: JSON.stringify({ ...body, ...(agentId ? { agent_id: agentId } : {}) }) }),
-      signal: stream ? signal : AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(10000)]),
+      signal: stream ? signal : AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(timeoutMs)]),
     });
     if (stream && response.ok) return response;
     const text = await response.text();
     if (Buffer.byteLength(text) > 1024 * 1024) throw new Error("invalid_response");
     let data;
     try { data = JSON.parse(text); } catch { throw new Error("invalid_response"); }
-    if (!response.ok) throw new Error(errorCode({ message: data?.error }));
+    if (!response.ok) {
+      const error = new Error(errorCode({ message: data?.error }));
+      error.retryable = data?.retryable;
+      if (error.message === "conversation_capped") {
+        if (!isUuid(data.conversation_id)) throw new Error("invalid_response");
+        error.conversation_id = data.conversation_id;
+      }
+      throw error;
+    }
     // Stop a response from an old account crossing an unlink/relink or consent change.
     if (messagingLinkKey(this.link()) !== messagingLinkKey(link)) throw new Error("link_changed");
     return data;
   }
-  async register() {
+  async register({ force = false } = {}) {
     const key = messagingLinkKey(this.link());
     const clients = this.repository.listClients().filter(c => !c.revoked_at);
     const rows = [];
     for (const client of clients) {
       const runtime = client.host === "claude-code" ? "claude_code" : client.host;
       const label = `${client.label} on ${this.hostname}`.slice(0, 80);
+      const stored = this.repository.db.prepare("SELECT * FROM messaging_agents WHERE client_id = ? AND link_key = ?").get(client.client_id, key);
+      if (!force && stored?.label === label && stored.runtime === runtime) {
+        if (!this.repository.listClients().some(c => c.client_id === client.client_id && !c.revoked_at)) continue;
+        rows.push({ client_id: stored.client_id, agent_id: stored.agent_id, link_key: stored.link_key });
+        continue;
+      }
       const { agent } = await this.request("register", { body: { installation: client.client_id, label, runtime } });
       if (!agent || !/^[0-9a-f-]{36}$/i.test(agent.id) || agent.installation !== client.client_id) throw new Error("invalid_response");
       if (!this.repository.listClients().some(c => c.client_id === client.client_id && !c.revoked_at)) continue;
@@ -77,12 +94,19 @@ export class MessagingRelay {
     const key = messagingLinkKey(this.link());
     return this.repository.db.prepare("SELECT a.* FROM messaging_agents a JOIN clients c USING(client_id) WHERE c.revoked_at IS NULL AND a.link_key = ?").all(key);
   }
+  forgetRegistration(agentId, error) {
+    if (!["agent_not_found", "agent_revoked"].includes(error?.message)) return false;
+    this.repository.db.prepare("DELETE FROM messaging_agents WHERE agent_id = ?").run(agentId);
+    return true;
+  }
   async peers(clientId = null) {
     let registrations = await this.register();
     if (clientId) registrations = registrations.filter(a => a.client_id === clientId);
     const agents = new Map(), groups = new Map(), proposals = new Map(), routes = [];
     for (const registration of registrations) {
-      const result = await this.request("agents", { agentId: registration.agent_id });
+      const result = await this.request("agents", { agentId: registration.agent_id }).catch(error => {
+        this.forgetRegistration(registration.agent_id, error); throw error;
+      });
       if (!Array.isArray(result.agents) || !Array.isArray(result.groups) || result.self?.id !== registration.agent_id) throw new Error("invalid_response");
       for (const proposal of result.proposals ?? []) {
         proposals.set(proposal.id, proposal);
@@ -121,7 +145,10 @@ export class MessagingRelay {
           const proposal = await this.request(`proposals?proposal_id=${encodeURIComponent(row.proposal_id)}`, { agentId: registration.agent_id });
           this.cacheProposal(proposal);
         }
-      } catch (error) { this.recordError(error); }
+      } catch (error) {
+        this.recordError(error);
+        if (this.forgetRegistration(registration.agent_id, error)) throw error;
+      }
     }
   }
   async inbound(registration) {
@@ -140,7 +167,9 @@ export class MessagingRelay {
         if (result.messages.length < 10) break;
       }
     };
-    const pending = run().finally(() => this.pulls.delete(registration.agent_id));
+    const pending = run().catch(error => {
+      this.forgetRegistration(registration.agent_id, error); throw error;
+    }).finally(() => this.pulls.delete(registration.agent_id));
     this.pulls.set(registration.agent_id, pending);
     return pending;
   }
@@ -150,7 +179,7 @@ export class MessagingRelay {
   async outbound(messageId = null) {
     const key = messagingLinkKey(this.link());
     this.repository.expireMessages();
-    const rows = this.repository.db.prepare("SELECT * FROM messages WHERE to_kind = 'hosted' AND origin = 'local' AND state = 'pending' AND (retry_at IS NULL OR retry_at <= ?) AND (? IS NULL OR message_id = ?) ORDER BY created_at").all(new Date().toISOString(), messageId, messageId);
+    const rows = this.repository.db.prepare("SELECT * FROM messages WHERE to_kind IN ('hosted','group') AND origin = 'local' AND state = 'pending' AND (retry_at IS NULL OR retry_at <= ?) AND (? IS NULL OR message_id = ?) ORDER BY created_at").all(new Date().toISOString(), messageId, messageId);
     for (const row of rows) {
       try {
         if (row.link_key !== key) throw new Error("link_changed");
@@ -162,13 +191,27 @@ export class MessagingRelay {
         const parentHostedId = parent?.origin === "hosted" ? parent.hosted_message_id : parent?.hosted_receipt_id;
         if (parent && !parentHostedId) throw new Error("parent_pending");
         const body = {
-          recipient_agent_id: row.to_ref, ...(row.hosted_group_id ? { group_id: row.hosted_group_id } : {}),
+          ...(row.to_kind === "group" ? {} : { recipient_agent_id: row.to_ref }), ...(row.hosted_group_id ? { group_id: row.hosted_group_id } : {}),
           ...(row.send_options ? JSON.parse(this.repository.payloadCodec.decode(row.send_options)) : {}),
           idempotency_key: row.idempotency_key, body: this.repository.payloadCodec.decode(content.content),
           ...(row.hosted_conversation_id ? { conversation_id: row.hosted_conversation_id } : {}),
           ...(parent ? { reply_to: parentHostedId } : {}),
         };
-        const result = await this.request("send", { agentId: row.hosted_sender_id, body });
+        const result = await this.request("send", { agentId: row.hosted_sender_id, body, timeoutMs: 30000 });
+        if (row.to_kind === "group") {
+          if (!result || !isUuid(result.post_id) || result.conversation_kind !== "group" || result.sender_agent_id !== row.hosted_sender_id
+            || result.group_id !== row.to_ref || !isUuid(result.conversation_id)
+            || (row.hosted_conversation_id && result.conversation_id !== row.hosted_conversation_id) || result.state !== "queued"
+            || !Array.isArray(result.recipient_agent_ids) || !result.recipient_agent_ids.every(isUuid)
+            || !Array.isArray(result.messages) || !result.messages.every(m => m && isUuid(m.id) && m.post_id === result.post_id
+              && isUuid(m.recipient_agent_id) && result.recipient_agent_ids.includes(m.recipient_agent_id))
+            || result.messages.length !== result.recipient_agent_ids.length
+            || new Set(result.messages.map(m => m.id)).size !== result.messages.length
+            || new Set(result.messages.map(m => m.recipient_agent_id)).size !== result.messages.length
+            || new Set(result.recipient_agent_ids).size !== result.recipient_agent_ids.length) throw new Error("invalid_response");
+          this.repository.completeOutbound(row.message_id, result);
+          continue;
+        }
         const unapprovedProposal = ["held", "denied", "expired"].includes(result.state)
           && result.group_id === null && /^[0-9a-f-]{36}$/i.test(result.proposal_id ?? "");
         if (result.sender_agent_id !== row.hosted_sender_id || result.recipient_agent_id !== row.to_ref
@@ -176,12 +219,17 @@ export class MessagingRelay {
         this.repository.completeOutbound(row.message_id, result);
         if (result.state === "held") {
           try { this.cacheProposal(await this.request(`proposals?proposal_id=${encodeURIComponent(result.proposal_id)}`, { agentId: row.hosted_sender_id })); }
-          catch (error) { this.recordError(error); }
+          catch (error) {
+            this.recordError(error);
+            if (this.forgetRegistration(row.hosted_sender_id, error)) throw error;
+          }
         }
       } catch (error) {
-        this.repository.db.prepare("UPDATE messages SET attempts=attempts+1, last_error=?, retry_at=? WHERE message_id=? AND state='pending'")
+        if (error.retryable === false) this.repository.failOutbound(row.message_id, errorCode(error), error.conversation_id);
+        else this.repository.db.prepare("UPDATE messages SET attempts=attempts+1, last_error=?, retry_at=? WHERE message_id=? AND state='pending'")
           .run(errorCode(error), new Date(Date.now() + Math.min(60000, 1000 * 2 ** Math.min(row.attempts, 6))).toISOString(), row.message_id);
         this.recordError(error);
+        if (this.forgetRegistration(row.hosted_sender_id, error)) throw error;
       }
     }
   }
@@ -229,11 +277,13 @@ export class MessagingRelay {
     }
     if (!release) return { status: "already_running" };
     try {
-      let reconciliation = 0;
+      let reconciliation = 0, firstReconciliation = true;
       while (!this.signal?.aborted && approvedMessagingLink(this.repository)) {
         if (Date.now() >= reconciliation) {
           try {
-            const registrations = await this.register();
+            const registration = firstReconciliation ? this.register({ force: true }) : this.register();
+            firstReconciliation = false;
+            const registrations = await registration;
             // Passport accepts at most eight streams for a device principal.
             const active = registrations.slice(0, 8);
             for (const [id, running] of this.streams) {
@@ -254,7 +304,7 @@ export class MessagingRelay {
                 await this.inbound(r);
                 const discovery = await this.request("agents", { agentId: r.agent_id });
                 for (const proposal of discovery.proposals ?? []) this.cacheProposal(proposal);
-              } catch (error) { this.recordError(error); }
+              } catch (error) { this.forgetRegistration(r.agent_id, error); this.recordError(error); }
             }));
           } catch (error) { this.recordError(error); }
           reconciliation = Date.now() + 20000;
@@ -296,7 +346,7 @@ export async function messageAgents(repository, input = null, options = {}) {
   try {
     const { agents, groups, proposals } = await new MessagingRelay(repository, options).peers(input?.client_id);
     if (input) repository.requireMessagingClient(input);
-    return { status: "ok", local, agents, groups, proposals };
+    return { status: "ok", local, agents: agents.map(agent => ({ ...agent, presence: agent.presence_kind === "events" ? "live through events" : agent.presence_kind === "webhook" ? "reachable through a wake webhook" : "offline" })), groups, proposals };
   } catch {
     if (input) repository.requireMessagingClient(input);
     return { status: "hosted_unavailable", local, agents: [], groups: [], proposals: [] };
@@ -305,34 +355,89 @@ export async function messageAgents(repository, input = null, options = {}) {
 
 export async function sendMessage(repository, input, { owner = false, ...options } = {}) {
   repository.requireMessagingClient(input, { owner });
-  if (typeof input.to !== "string" || !input.to.trim()) throw new Error("invalid message target");
+  if (input.to != null && (typeof input.to !== "string" || !input.to.trim())) throw new Error("invalid message target");
   const local = repository.listClients().find(c => c.client_id === input.to);
   if (local) return repository.sendMessage(input, { owner });
   const relay = new MessagingRelay(repository, options);
-  const peers = await relay.peers(owner ? null : input.client_id);
-  const matches = peers.agents.filter(a => a.id === input.to || a.label === input.to);
-  if (matches.length !== 1) throw new Error(matches.length ? `ambiguous hosted label: ${matches.map(a => a.id).join(", ")}` : "invalid message target");
-  const peer = matches[0];
   const parent = input.reply_to ? repository.db.prepare("SELECT * FROM messages WHERE message_id = ?").get(input.reply_to) : null;
-  const routes = peers.routes.filter(r => r.ref === peer.id && (!parent || r.sender_id === parent.hosted_sender_id));
-  const route = parent
-    ? routes.find(r => r.group_id === parent.hosted_group_id) ?? (routes[0] ? { ...routes[0], group_id: parent.hosted_group_id } : null)
-    : routes.find(r => r.group_id) ?? routes[0];
-  if (!route) throw new Error("invalid message group");
-  if (!route.group_id && !(typeof input.purpose === "string" && input.purpose.trim())) throw new Error("purpose_required");
-  validateProposalOptions(input);
-  const result = repository.sendMessage({ ...input, to: peer.id }, {
-    owner, target: { kind: "hosted", ...route, link_key: messagingLinkKey(relay.link()) },
-  });
+  const groupReply = parent?.origin === "hosted" && parent.conversation_kind === "group";
+  const groupSend = groupReply || !input.reply_to && input.to == null && (input.group_id != null || input.conversation_id != null);
+  if (!groupSend) for (const field of ["group_id", "conversation_id"]) {
+    if (input[field] != null) throw new Error(`invalid ${field}`);
+  }
+  if (!groupSend && input.to == null) throw new Error("invalid message target");
+  if (groupSend) for (const field of ["purpose", "name", "duration_hours"]) {
+    if (input[field] != null) throw new Error(`invalid ${field}`);
+  }
+  if (groupReply) {
+    // Refuse mismatched thread replies before any discovery round trip.
+    if (input.to != null && ![parent.from_ref, parent.from_label, parent.hosted_group_id].includes(input.to)) throw new Error("invalid message target");
+    if (input.group_id != null && input.group_id !== parent.hosted_group_id) throw new Error("invalid group_id");
+    if (input.conversation_id != null && input.conversation_id !== parent.hosted_conversation_id) throw new Error("invalid conversation_id");
+  } else if (groupSend) for (const field of ["group_id", "conversation_id"]) {
+    if (input[field] != null && !isUuid(input[field])) throw new Error(`invalid ${field}`);
+  }
+  const key = messagingLinkKey(relay.link());
+  if (groupSend && !groupReply && input.group_id != null && input.conversation_id != null
+    && repository.db.prepare("SELECT 1 FROM messages WHERE hosted_conversation_id = ? AND link_key = ? AND hosted_group_id IS NOT ? LIMIT 1")
+      .get(input.conversation_id, key, input.group_id)) throw new Error("invalid conversation_id");
+  const peers = await relay.peers(owner ? null : input.client_id);
+  const registrations = relay.registrations();
+  const explicitSender = owner && input.client_id != null;
+  if (explicitSender && !registrations.some(r => r.client_id === input.client_id)) throw new Error("--from must name an active local client_id");
+  const eligible = registrations.filter(r => owner && !explicitSender || r.client_id === input.client_id);
+  let route, target;
+  if (groupSend) {
+    let groupId, conversationId = null, registration;
+    if (groupReply) {
+      registration = eligible.find(r => r.agent_id === parent.hosted_sender_id);
+      if (!registration || parent.link_key !== key) throw new Error("invalid reply_to");
+      groupId = parent.hosted_group_id; conversationId = parent.hosted_conversation_id;
+    } else if (input.group_id != null) {
+      const group = peers.groups.find(g => g.id === input.group_id);
+      if (!group) throw new Error("group_unauthorized");
+      registration = eligible.find(r => group.agent_ids.includes(r.agent_id));
+      if (!registration) {
+        if (!owner || explicitSender) throw new Error("group_unauthorized");
+        throw new Error("Cannot determine a local member of this group; pass --from <client_id> to select the sending installation");
+      }
+      groupId = group.id; conversationId = input.conversation_id ?? null;
+    } else {
+      const row = eligible.length ? repository.db.prepare(`SELECT hosted_group_id, hosted_sender_id FROM messages
+        WHERE hosted_conversation_id = ? AND link_key = ? AND conversation_kind = 'group'
+        AND hosted_sender_id IN (${eligible.map(() => "?").join(",")}) LIMIT 1`).get(input.conversation_id, key, ...eligible.map(r => r.agent_id)) : null;
+      if (!row) throw new Error("conversation_not_found");
+      registration = eligible.find(r => r.agent_id === row.hosted_sender_id);
+      groupId = row.hosted_group_id; conversationId = input.conversation_id;
+    }
+    route = { ref: groupId, group_id: groupId, sender_id: registration.agent_id, conversation_id: conversationId };
+    target = { kind: "group", ...route, link_key: key };
+  } else {
+    const matches = peers.agents.filter(a => a.id === input.to || a.label === input.to);
+    if (matches.length !== 1) throw new Error(matches.length ? `ambiguous hosted label: ${matches.map(a => a.id).join(", ")}` : "invalid message target");
+    const peer = matches[0];
+    const routes = peers.routes.filter(r => r.ref === peer.id && (!parent || r.sender_id === parent.hosted_sender_id) && (!explicitSender || r.client_id === input.client_id));
+    route = parent
+      ? routes.find(r => r.group_id === parent.hosted_group_id) ?? (routes[0] ? { ...routes[0], group_id: parent.hosted_group_id } : null)
+      : routes.find(r => r.group_id) ?? routes[0];
+    if (!route) throw new Error("invalid message group");
+    if (!route.group_id && !(typeof input.purpose === "string" && input.purpose.trim())) throw new Error("purpose_required");
+    validateProposalOptions(input);
+    target = { kind: "hosted", ...route, link_key: key };
+  }
+  const result = repository.sendMessage({ ...input, to: route.ref }, { owner, target });
   // Attempt this send before returning so a live background relay does not hide
   // a held receipt. Concurrent attempts use the same durable idempotency key.
   await relay.outbound(result.message_id);
-  const receipt = withApprovalNotice(repository.messageStatus(result.message_id));
+  const receipt = withApprovalNotice({ ...repository.messageStatus(result.message_id), ...(result.replayed ? { replayed: true } : {}) });
   return !route.group_id && receipt.state === "pending" ? { ...receipt, notice: `Waiting to submit to Passport. ${APPROVAL_NOTICE}` } : receipt;
 }
 
+export const CONTINUE_NOTICE = "This group thread has reached its post cap. Ask the owner to approve more posts with switchboard message propose --kind continue --conversation-id <id> or the passport_propose_collaboration tool with kind continue.";
+export const continueNotice = id => CONTINUE_NOTICE.replace("<id>", id);
 export const APPROVAL_NOTICE = "The owner must approve this collaboration in Passport Inbox on web or iOS. Passport sends a push notification.";
 export function withApprovalNotice(value) {
+  if (value.state === "expired" && value.last_error === "conversation_capped") return { ...value, notice: continueNotice(value.hosted_conversation_id) };
   return value.state === "held" || value.state === "pending" && value.kind
     ? { ...value, notice: APPROVAL_NOTICE } : value;
 }

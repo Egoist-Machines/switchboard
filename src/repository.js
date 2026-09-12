@@ -78,7 +78,7 @@ export function unsupportedSchemaVersionMessage(version, expectedVersion = SCHEM
 
 function assertSchemaCompatible(db) {
   const version = existingSchemaVersion(db);
-  if (version !== null && !["4", "5", "6", "7", "8", "9", "10", String(SCHEMA_VERSION)].includes(version)) {
+  if (version !== null && !["4", "5", "6", "7", "8", "9", "10", "11", String(SCHEMA_VERSION)].includes(version)) {
     throw new Error(unsupportedSchemaVersionMessage(version));
   }
   return version;
@@ -157,6 +157,21 @@ function migrateV10ToV11(db) {
   }).immediate();
 }
 
+function migrateV11ToV12(db) {
+  db.transaction(() => {
+    const sql = db.prepare("SELECT sql FROM sqlite_master WHERE name = 'messages'").get().sql;
+    const columns = db.pragma("table_info(messages)").map(column => column.name);
+    db.exec("ALTER TABLE messages RENAME TO messages_v11");
+    let next = sql.replace("to_kind IN ('client','hosted')", "to_kind IN ('client','hosted','group')");
+    if (!columns.includes("conversation_kind")) next = next.replace("conversation_id TEXT NOT NULL,", "conversation_id TEXT NOT NULL, conversation_kind TEXT NOT NULL DEFAULT 'pair' CHECK (conversation_kind IN ('pair','group')), hosted_post_id TEXT,");
+    if (!columns.includes("hosted_reply_to")) next = next.replace("reply_to TEXT,", "reply_to TEXT, hosted_reply_to TEXT,");
+    db.exec(next);
+    db.exec(`INSERT INTO messages (${columns.join(",")}) SELECT ${columns.join(",")} FROM messages_v11;
+      DROP TABLE messages_v11;
+      UPDATE meta SET value = '12' WHERE key = 'schema_version';`);
+  }).immediate();
+}
+
 function messageMetadata(row) {
   const { request_hash, claim_pid, send_options, ...metadata } = row;
   return metadata;
@@ -170,6 +185,7 @@ function migrateMessaging(db) {
   db.pragma("legacy_alter_table = ON");
   try {
     db.transaction(() => {
+      if (existingSchemaVersion(db) === "11") migrateV11ToV12(db);
       // Rebuild the CHECK constraint without changing event ids or referencing tables.
       const sql = db.prepare("SELECT sql FROM sqlite_master WHERE name = 'events'").get().sql;
       db.exec("DROP TRIGGER IF EXISTS events_forbid_update; DROP TRIGGER IF EXISTS events_forbid_delete;");
@@ -323,11 +339,14 @@ function schema(db) {
     CREATE TABLE IF NOT EXISTS messages (
       message_id TEXT PRIMARY KEY,
       conversation_id TEXT NOT NULL,
+      conversation_kind TEXT NOT NULL DEFAULT 'pair' CHECK (conversation_kind IN ('pair','group')),
+      hosted_post_id TEXT,
       reply_to TEXT,
+      hosted_reply_to TEXT,
       from_kind TEXT NOT NULL CHECK (from_kind IN ('client','hosted','owner')),
       from_ref TEXT,
       from_label TEXT,
-      to_kind TEXT NOT NULL CHECK (to_kind IN ('client','hosted')),
+      to_kind TEXT NOT NULL CHECK (to_kind IN ('client','hosted','group')),
       to_ref TEXT NOT NULL,
       content_version INTEGER NOT NULL DEFAULT 1,
       state TEXT NOT NULL CHECK (state IN ('pending','notified','held','delivered','expired')),
@@ -354,8 +373,17 @@ function schema(db) {
     CREATE UNIQUE INDEX IF NOT EXISTS messages_owner_idempotency ON messages(idempotency_key) WHERE from_kind = 'owner';
     CREATE UNIQUE INDEX IF NOT EXISTS messages_hosted_inbound ON messages(hosted_message_id) WHERE origin = 'hosted';
     CREATE INDEX IF NOT EXISTS messages_hosted_receipt ON messages(hosted_receipt_id);
+    CREATE INDEX IF NOT EXISTS messages_hosted_conversation ON messages(hosted_conversation_id);
+    CREATE INDEX IF NOT EXISTS messages_hosted_post ON messages(hosted_post_id);
+    CREATE INDEX IF NOT EXISTS messages_hosted_reply_repair ON messages(hosted_reply_to, link_key, hosted_sender_id) WHERE origin = 'hosted' AND reply_to IS NULL;
     CREATE INDEX IF NOT EXISTS messages_inbox ON messages(to_ref, state, created_at, message_id);
     CREATE INDEX IF NOT EXISTS messages_expiry ON messages(state, expires_at);
+    CREATE TABLE IF NOT EXISTS messaging_post_copies (
+      hosted_message_id TEXT PRIMARY KEY,
+      message_id TEXT NOT NULL REFERENCES messages(message_id),
+      recipient_agent_id TEXT NOT NULL,
+      link_key TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS messaging_proposals (
       proposal_id TEXT NOT NULL,
       link_key TEXT NOT NULL,
@@ -594,6 +622,7 @@ export class LocalRepository {
       if (version === "4") migrateV4ToV5(this.db);
       if (version === "9") migrateV9ToV10(this.db);
       if (["9", "10"].includes(version)) migrateV10ToV11(this.db);
+      if (existingSchemaVersion(this.db) === "11") migrateMessaging(this.db);
       schema(this.db);
       if (version === "4" || version === "5") this.#migrateV5ToV6();
       if (["4", "5", "6"].includes(version)) this.#migrateV6ToV7();
@@ -2414,13 +2443,16 @@ export class LocalRepository {
       requireUuid(input?.idempotency_key, "idempotency_key");
       if (typeof input.body !== "string" || !input.body.trim() || Buffer.byteLength(input.body) > MAX_CONTENT_BYTES) throw new Error("invalid message body");
       if (screenContent(input.body)) throw new Error("message_content_refused");
-      const local = this.db.prepare("SELECT * FROM clients WHERE client_id = ? AND revoked_at IS NULL").get(input.to);
+      const local = this.db.prepare("SELECT * FROM clients WHERE client_id = ? AND revoked_at IS NULL").get(input.to ?? null);
       target ??= local ? { kind: "client", ref: local.client_id } : null;
-      if (!target || !["client", "hosted"].includes(target.kind)) throw new Error("invalid message target");
+      if (!target || !["client", "hosted", "group"].includes(target.kind)) throw new Error("invalid message target");
+      if (target.kind !== "group") for (const field of ["group_id", "conversation_id"]) {
+        if (input[field] != null) throw new Error(`invalid ${field}`);
+      }
       if (target.kind === "client" && !local) throw new Error("invalid target client");
       const fromKind = owner ? "owner" : "client";
       const fromRef = client?.client_id ?? null;
-      const requestHash = createHash("sha256").update(json([input.to, input.reply_to ?? null, input.body, ...(target.kind === "hosted" && (input.purpose != null || input.name != null || input.duration_hours != null) ? [input.purpose ?? null, input.name ?? null, input.duration_hours ?? null] : [])])).digest("hex");
+      const requestHash = createHash("sha256").update(json([input.to ?? target.ref, input.reply_to ?? null, input.body, ...(target.kind === "group" ? [target.conversation_id ?? null, target.sender_id] : []), ...(target.kind === "hosted" && (input.purpose != null || input.name != null || input.duration_hours != null) ? [input.purpose ?? null, input.name ?? null, input.duration_hours ?? null] : [])])).digest("hex");
       const existing = this.db.prepare("SELECT * FROM messages WHERE from_kind = ? AND from_ref IS ? AND idempotency_key = ?")
         .get(fromKind, fromRef, input.idempotency_key);
       if (existing) {
@@ -2432,17 +2464,18 @@ export class LocalRepository {
         requireUuid(input.reply_to, "reply_to");
         parent = this.db.prepare("SELECT * FROM messages WHERE message_id = ?").get(input.reply_to);
         if (!parent || parent.to_kind !== "client" || (!owner && parent.to_ref !== fromRef) ||
-          parent.from_kind !== target.kind || parent.from_ref !== target.ref) throw new Error("invalid reply_to");
-        if (target.kind === "hosted" && parent.link_key !== target.link_key) throw new Error("invalid reply_to link");
+          (target.kind === "group" ? parent.origin !== "hosted" || parent.conversation_kind !== "group" || parent.hosted_group_id !== target.ref
+            : parent.from_kind !== target.kind || parent.from_ref !== target.ref)) throw new Error("invalid reply_to");
+        if (["hosted", "group"].includes(target.kind) && parent.link_key !== target.link_key) throw new Error("invalid reply_to link");
       }
       const row = {
         message_id: this.uuid(), conversation_id: parent?.conversation_id ?? this.uuid(),
         reply_to: parent?.message_id ?? null, from_kind: fromKind, from_ref: fromRef,
         from_label: client?.label ?? "Owner", to_kind: target.kind, to_ref: target.ref,
-        origin: "local", hosted_message_id: null,
+        origin: "local", hosted_message_id: null, conversation_kind: target.kind === "group" ? "group" : "pair",
         send_options: target.kind === "hosted" ? this.payloadCodec.encode(json(Object.fromEntries(["purpose", "name", "duration_hours"].filter(key => input[key] != null).map(key => [key, input[key]])))) : null,
         hosted_group_id: parent?.hosted_group_id ?? target.group_id ?? null,
-        hosted_conversation_id: parent?.hosted_conversation_id ?? null,
+        hosted_conversation_id: parent?.hosted_conversation_id ?? target.conversation_id ?? null,
         hosted_sender_id: target.sender_id ?? null, link_key: target.link_key ?? null,
         idempotency_key: input.idempotency_key, request_hash: requestHash,
         created_at: this.#now(), expires_at: new Date(Date.parse(this.#now()) + DEFAULT_HANDOFF_TTL_MS).toISOString(),
@@ -2464,6 +2497,10 @@ export class LocalRepository {
     return this.db.transaction(() => {
       if (!this.messagingEnabled()) throw new Error("messaging_disabled");
       if (!this.db.prepare("SELECT 1 FROM clients WHERE client_id = ? AND revoked_at IS NULL").get(clientId)) throw new Error("invalid target client");
+      const kind = message.conversation_kind === undefined ? "pair" : message.conversation_kind;
+      if (!["pair", "group"].includes(kind)) throw new Error("invalid_response");
+      if (kind === "group" && ![message.post_id, message.group_id].every(value => typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value))) throw new Error("invalid_response");
+      if (message.reply_to != null) requireUuid(message.reply_to, "reply_to");
       const existing = this.db.prepare("SELECT * FROM messages WHERE origin = 'hosted' AND hosted_message_id = ?").get(message.id);
       if (existing) {
         if (existing.to_ref !== clientId || existing.link_key !== linkKey) throw new Error("invalid hosted recipient");
@@ -2472,13 +2509,17 @@ export class LocalRepository {
       for (const field of ["id", "conversation_id", "group_id", "sender_agent_id", "recipient_agent_id"]) requireUuid(message[field], field);
       if (typeof message.body !== "string" || !message.body.trim() || Buffer.byteLength(message.body) > MAX_CONTENT_BYTES || screenContent(message.body)) throw new Error("message_content_refused");
       if (!Number.isFinite(Date.parse(message.expires_at)) || !Number.isFinite(Date.parse(message.created_at))) throw new Error("invalid message dates");
-      const parent = message.reply_to ? this.db.prepare("SELECT * FROM messages WHERE origin = 'local' AND hosted_receipt_id = ? AND link_key = ? AND hosted_sender_id = ? AND to_ref = ?")
-        .get(message.reply_to, linkKey, message.recipient_agent_id, message.sender_agent_id) : null;
+      const parent = !message.reply_to ? null : kind === "group"
+        ? this.db.prepare("SELECT m.* FROM messaging_post_copies c JOIN messages m USING(message_id) WHERE c.hosted_message_id = ? AND c.link_key = ? AND m.link_key = ? AND m.hosted_sender_id = ?")
+          .get(message.reply_to, linkKey, linkKey, message.recipient_agent_id)
+        : this.db.prepare("SELECT * FROM messages WHERE origin = 'local' AND hosted_receipt_id = ? AND link_key = ? AND hosted_sender_id = ? AND to_ref = ?")
+        .get(message.reply_to, linkKey, message.recipient_agent_id, message.sender_agent_id);
       const row = {
         message_id: this.uuid(), conversation_id: parent?.conversation_id ?? message.conversation_id,
-        reply_to: parent?.message_id ?? null, from_kind: "hosted", from_ref: message.sender_agent_id,
+        reply_to: parent?.message_id ?? null, hosted_reply_to: message.reply_to ?? null, from_kind: "hosted", from_ref: message.sender_agent_id,
         from_label: typeof message.sender_label === "string" ? message.sender_label.slice(0, 120) : message.sender_agent_id,
         to_kind: "client", to_ref: clientId, origin: "hosted", hosted_message_id: message.id,
+        conversation_kind: kind, hosted_post_id: kind === "group" ? message.post_id : null,
         hosted_group_id: message.group_id, hosted_conversation_id: message.conversation_id,
         hosted_sender_id: message.recipient_agent_id, link_key: linkKey,
         idempotency_key: message.id, request_hash: "hosted",
@@ -2568,10 +2609,44 @@ export class LocalRepository {
     }).immediate();
   }
 
+  failOutbound(messageId, code, conversationId = null) {
+    this.db.transaction(() => {
+      const row = this.db.prepare("SELECT state FROM messages WHERE message_id = ?").get(messageId);
+      if (row?.state !== "pending") return;
+      this.db.prepare("UPDATE messages SET attempts=attempts+1, last_error=?, retry_at=NULL, hosted_conversation_id=coalesce(?, hosted_conversation_id) WHERE message_id=?")
+        .run(code, conversationId, messageId);
+      this.#expireMessage(messageId);
+    }).immediate();
+  }
+
+  postStatus(postId, input) {
+    const client = this.requireMessagingClient(input);
+    requireUuid(postId, "post_id");
+    const row = this.db.prepare(`SELECT m.message_id FROM messages m JOIN messaging_agents a ON a.agent_id = m.hosted_sender_id AND a.link_key = m.link_key
+      WHERE m.origin = 'local' AND m.hosted_post_id = ? AND a.client_id = ?`).get(postId, client.client_id);
+    if (!row) throw new Error("message_not_found");
+    return this.messageStatus(row.message_id);
+  }
+
   completeOutbound(messageId, hosted) {
     this.db.transaction(() => {
       const row = this.db.prepare("SELECT * FROM messages WHERE message_id = ?").get(messageId);
       if (!row || !["pending", "held"].includes(row.state)) return;
+      if (row.to_kind === "group") {
+        requireUuid(hosted.post_id, "post_id");
+        if (hosted.state !== "queued") throw new Error("invalid_response");
+        this.db.prepare(`UPDATE messages SET state='delivered', delivered_at=?, hosted_post_id=?, hosted_receipt_id=NULL,
+          hosted_conversation_id=?, hosted_group_id=?, conversation_id=CASE WHEN reply_to IS NULL THEN ? ELSE conversation_id END,
+          last_error=NULL, retry_at=NULL WHERE message_id=?`)
+          .run(this.#now(), hosted.post_id, hosted.conversation_id, hosted.group_id, hosted.conversation_id, messageId);
+        for (const copy of hosted.messages) this.db.prepare("INSERT OR REPLACE INTO messaging_post_copies(hosted_message_id, message_id, recipient_agent_id, link_key) VALUES (?, ?, ?, ?)")
+          .run(copy.id, messageId, copy.recipient_agent_id, row.link_key);
+        if (hosted.messages.length) this.db.prepare(`UPDATE messages SET reply_to = ? WHERE origin = 'hosted' AND link_key = ? AND hosted_sender_id = ?
+          AND reply_to IS NULL AND hosted_reply_to IN (${hosted.messages.map(() => "?").join(",")})`)
+          .run(messageId, row.link_key, row.hosted_sender_id, ...hosted.messages.map(copy => copy.id));
+        this.#appendLocalEvent({ entityId: messageId, op: "message_delivered", actor: "owner" });
+        return;
+      }
       requireUuid(hosted.id, "id");
       if (row.hosted_receipt_id && row.hosted_receipt_id !== hosted.id) throw new Error("invalid_response");
       const state = hosted.state ?? "queued";
@@ -2597,7 +2672,7 @@ export class LocalRepository {
 
   listMessages() {
     this.expireMessages();
-    return this.db.prepare("SELECT message_id, conversation_id, from_kind, from_ref, to_kind, to_ref, state, origin, proposal_id, hosted_receipt_id, created_at, expires_at, delivered_at, last_error FROM messages ORDER BY created_at DESC LIMIT 100").all();
+    return this.db.prepare("SELECT message_id, conversation_id, conversation_kind, hosted_post_id, from_kind, from_ref, to_kind, to_ref, state, origin, proposal_id, hosted_receipt_id, created_at, expires_at, delivered_at, last_error FROM messages ORDER BY created_at DESC LIMIT 100").all();
   }
 
   close() {
