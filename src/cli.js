@@ -126,7 +126,7 @@ function printUsage() {
     "Commands: init, status, remember, recall, inbox, client, grant, profile, config, memory, handoff, link, unlink, sync [--replay-from <seq>], doctor, coding, hook, prefetch, propose, handoff-create, handoff-claim, message, message-send, message-receive, message-ack, message-agents, message-propose, message-proposal-status, messaging, channel\n" +
     "Version: switchboard --version, switchboard -v, switchboard version\n" +
     "Coding: switchboard coding import [--project <path>] [--dry-run]\n" +
-    "Messaging: switchboard message send --to <id> [--purpose <text>] <text>; switchboard message propose --to <id>[,<id>] --purpose <text> [--name N] [--duration-hours H]; switchboard messaging status|relay; switchboard config messaging on|off\n");
+    "Messaging: switchboard message send [--to <id>] [--group <group_id>] [--conversation <thread_id>] [--reply-to <local_id>] [--from <client_id>] [--purpose <text>] [--name <name>] [--duration-hours N] <text>; switchboard message propose --to <id>[,<id>] --purpose <text> [--name N] [--duration-hours H]; switchboard messaging status|relay; switchboard config messaging on|off\n");
 }
 
 function humanRows(rows) {
@@ -231,7 +231,7 @@ async function runMachine(command, repository, preparedInput = null) {
     throw new Error("unknown machine command");
   } catch (error) {
     if (command.startsWith("message-")) {
-      const known = /^(purpose_required|proposal_not_found|proposal_limit|agent_required|messaging_disabled|message_content_refused|message_not_found|message_not_received|idempotency_conflict|messaging_unlinked_or_disabled)$/;
+      const known = /^(conversation_capped|group_unauthorized|conversation_not_found|conversation_unavailable|recipient_unavailable|queue_full|invalid_reply|message_unavailable|content_rejected|not_found|rate_limited|purpose_required|proposal_not_found|proposal_limit|agent_required|messaging_disabled|message_content_refused|message_not_found|message_not_received|idempotency_conflict|messaging_unlinked_or_disabled)$/;
       writeJson({ status: "error", error: known.test(error.message) ? error.message : /authentication/.test(error.message) ? "unauthorized" : /invalid|ambiguous/.test(error.message) ? "invalid_request" : "unavailable" });
       return 0;
     }
@@ -361,11 +361,13 @@ async function main(args = process.argv.slice(2)) {
       else if (args[1] === "send") {
         const positional = [];
         for (let i = 2; i < args.length; i++) {
-          if (["--to", "--reply-to", "--purpose", "--name", "--duration-hours"].includes(args[i])) { i++; continue; }
+          if (["--to", "--group", "--conversation", "--from", "--reply-to", "--purpose", "--name", "--duration-hours"].includes(args[i])) { i++; continue; }
           positional.push(args[i]);
         }
         if (positional.length !== 1) throw new Error("message send requires text");
-        writeJson(await sendMessage(repository, { to: option(args, "--to"), reply_to: option(args, "--reply-to"), purpose: option(args, "--purpose"), name: option(args, "--name"), duration_hours: option(args, "--duration-hours") == null ? undefined : Number(option(args, "--duration-hours")), body: positional[0], idempotency_key: randomUUID() }, { owner: true }));
+        const receipt = await sendMessage(repository, { client_id: option(args, "--from"), group_id: option(args, "--group"), conversation_id: option(args, "--conversation"), to: option(args, "--to"), reply_to: option(args, "--reply-to"), purpose: option(args, "--purpose"), name: option(args, "--name"), duration_hours: option(args, "--duration-hours") == null ? undefined : Number(option(args, "--duration-hours")), body: positional[0], idempotency_key: randomUUID() }, { owner: true });
+        writeJson(receipt);
+        if (receipt.state === "expired" && receipt.last_error === "conversation_capped") { process.stderr.write(`${receipt.notice}\n`); return 2; }
       } else throw new Error("message requires send, propose, proposal-status, list, or agents");
       return 0;
     }
@@ -661,7 +663,7 @@ async function main(args = process.argv.slice(2)) {
       const safe = [
         "Cannot determine a local member of this group; pass --from <client_id> to select the sending installation",
         "--from must name an active local client_id",
-      ].includes(error.message) || /^(?:invalid |message |messaging |channel |ambiguous hosted label: )[a-zA-Z0-9 ,:_-]+$/.test(error.message) || /^(?:messaging_[a-z_]+|message_[a-z_]+|channel_already_running|authentication failed)$/.test(error.message);
+      ].includes(error.message) || /^(?:invalid |message |messaging |channel |ambiguous hosted label: )[a-zA-Z0-9 ,:_-]+$/.test(error.message) || /^(?:conversation_capped|group_unauthorized|conversation_not_found|conversation_unavailable|recipient_unavailable|queue_full|rate_limited|messaging_[a-z_]+|message_[a-z_]+|channel_already_running|authentication failed)$/.test(error.message);
       process.stderr.write(`${safe ? error.message : "Messaging is unavailable."}\n`);
       return 2;
     }

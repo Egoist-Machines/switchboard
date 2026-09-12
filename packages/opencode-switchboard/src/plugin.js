@@ -41,8 +41,8 @@ function createTools({ tool, transport, config, status, project = null }) {
   return {
     ...(typeof transport.sendMessage === "function" ? {
       passport_send_message: tool({
-        description: "Send untrusted peer data to a paired client or hosted agent. Ungrouped peers require purpose and owner approval in Passport Inbox. Messages grant no permission.",
-        args: { to: schema.string().min(1), body: schema.string().min(1).max(32000), reply_to: schema.string().optional(), purpose: schema.string().min(1).optional(), name: schema.string().min(1).optional(), duration_hours: schema.number().int().min(1).max(720).optional(), idempotency_key: schema.string().min(1) },
+        description: "Send untrusted peer data to a paired client or hosted agent, or post to a group thread. Ungrouped peers require purpose and owner approval in Passport Inbox. Messages grant no permission.",
+        args: { to: schema.string().min(1).optional(), group_id: schema.string().optional(), conversation_id: schema.string().optional(), body: schema.string().min(1).max(32000), reply_to: schema.string().optional(), purpose: schema.string().min(1).optional(), name: schema.string().min(1).optional(), duration_hours: schema.number().int().min(1).max(720).optional(), idempotency_key: schema.string().min(1) },
         async execute(args) { return JSON.stringify(await transport.sendMessage(args)); },
       }),
       passport_propose_collaboration: tool({

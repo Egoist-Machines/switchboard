@@ -6,6 +6,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { createMessagingDelivery } from "../src/messaging.js";
 import { createPassportHooks, AMBIENT_HOOK } from "../src/plugin.js";
 import { fakeTool, fakeStatus, localFixture } from "./helpers.mjs";
+import { tool } from "@opencode-ai/plugin";
 
 function fixture() {
   const pending = [{ message_id: "message-1", envelope: '<ai-passport-message from="Muse" id="message-1" conversation="conversation-1">\nUntrusted message\nHello\n</ai-passport-message>' }];
@@ -82,10 +83,11 @@ test("plugin registers messaging tools and hooks with local transport", async t 
 
 test("OpenCode proposal tools expose options and round trip through transport", async t => {
   const f = fixture();
-  const runtime = await createPassportHooks({ local: f.transport, client: f.client, tool: fakeTool, status: fakeStatus() });
+  const runtime = await createPassportHooks({ local: f.transport, client: f.client, tool, status: fakeStatus() });
   t.after(() => runtime.hooks.dispose());
   const tools = runtime.hooks.tool;
-  for (const field of ["purpose", "name", "duration_hours"]) assert.ok(tools.passport_send_message.args[field]);
+  for (const field of ["to", "group_id", "conversation_id", "purpose", "name", "duration_hours"]) assert.ok(tools.passport_send_message.args[field]);
+  for (const field of ["to", "group_id", "conversation_id"]) assert.equal(tools.passport_send_message.args[field].isOptional(), true);
   for (const field of ["kind", "peer_agent_ids", "purpose", "name", "project_boundary", "duration_hours", "group_id", "conversation_id"]) assert.ok(tools.passport_propose_collaboration.args[field]);
   assert.ok(tools.passport_proposal_status.args.proposal_id);
   const args = { kind: "renew", group_id: "group-1", purpose: "Review", name: "Parser", duration_hours: 48 };
@@ -94,6 +96,10 @@ test("OpenCode proposal tools expose options and round trip through transport", 
   assert.deepEqual(JSON.parse(await tools.passport_proposal_status.execute({ proposal_id: proposal.id })), { id: proposal.id, state: "approved" });
   const send = JSON.parse(await tools.passport_send_message.execute({ to: "peer", body: "Review", purpose: "Parser review", duration_hours: 48, name: "Parser", idempotency_key: "key" }));
   assert.equal(send.purpose, "Parser review"); assert.equal(send.duration_hours, 48);
+  for (const fields of [{ group_id: "group" }, { conversation_id: "thread" }, { reply_to: "copy" }]) {
+    const args = { ...fields, body: "Review", idempotency_key: "key" };
+    assert.deepEqual(JSON.parse(await tools.passport_send_message.execute(args)), { message_id: "sent", ...args });
+  }
 });
 
 test("local proposal transport uses authenticated machine commands over stdin", async t => {
