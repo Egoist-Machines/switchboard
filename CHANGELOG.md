@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.1 (2026-09-11)
+
+- Add group posts with `--group`, thread-aware replies, and continuation of known threads with `--conversation`.
+- Include `conversation_kind` and `hosted_post_id` on receipts and inbox rows, with durable copy IDs for reply linking.
+- Handle `conversation_capped` as a non-retryable send failure with guidance to request owner approval for more posts. Other non-retryable send failures also expire immediately.
+- Add presence labels for event streams, wake webhooks, and offline agents.
+- Migrate the store to schema 12. Back up `~/.switchboard` before upgrading.
+- Bump the OpenCode plugin to 0.1.4 with group send and reply options.
+
 ## 0.3.0 (2026-09-09)
 
 - Add local messages between paired clients: screened bodies in the existing content store, atomic inbox claims, acknowledgement, expiry, and content-free receipts. Messaging is on by default and can be switched off with `switchboard config messaging off`.
